@@ -13,6 +13,7 @@ import scipy.io
 from datetime import datetime
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
+from pathlib import Path
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -42,6 +43,10 @@ saved_model_path = args.saved_model_path
 BATCH_SIZE = args.BATCH_SIZE
 plot_path = args.plot_path
 training = args.training
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+HUTUBS_DIR = PROJECT_ROOT / "HUTUBS"
 
 
 def adjust_learning_rate(args, lr, optimizer, epoch_num):
@@ -83,13 +88,13 @@ if training:
 
         if val_subject_idx not in {17, 78, 91}:
             hutubs_dataset = HUTUBSDataset(
-                hrtf_directory='HUTUBS/HRIRs',
-                anthro_csv_path='HUTUBS/AntrhopometricMeasures.csv',
+                hrtf_directory=HUTUBS_DIR / "HRIRs",
+                anthro_csv_path=HUTUBS_DIR / "AntrhopometricMeasures.csv",
                 val_sub_idx=val_subject_idx,
                 pad_size=10
             )
 
-            writer = SummaryWriter(f"runs/test_03_right_{val_subject_idx}")
+            writer = SummaryWriter(f"runs/test_{val_subject_idx}")
             saved_model_path = 'saved_models/LOO00CV_left'
             unet = UNet(labels=441, head_embedding=True, ears_embedding=True)
             unet.to(device)

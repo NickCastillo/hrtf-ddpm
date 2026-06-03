@@ -7,7 +7,10 @@ from pysofaconventions import *
 import numpy as np
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+HUTUBS_DIR = PROJECT_ROOT / "HUTUBS"
 
 class HUTUBSDataset(Dataset):
     def __init__(self, hrtf_directory, anthro_csv_path, val_sub_idx, pad_size=10):
@@ -19,6 +22,7 @@ class HUTUBSDataset(Dataset):
 
     def pad_audio(self, audio):
         return F.pad(audio, (self.pad_size, self.pad_size), mode='reflect')
+
     def load_data(self):
         subject = []
         hrtf_points = []
@@ -129,11 +133,11 @@ class HUTUBSDataset(Dataset):
 
 
 hutubs_dataset = HUTUBSDataset(
-                hrtf_directory='HUTUBS/HRIRs',
-                anthro_csv_path='HUTUBS/AntrhopometricMeasures.csv',
-                val_sub_idx=1,
-                pad_size=10
-            )
+    hrtf_directory=HUTUBS_DIR / "HRIRs",
+    anthro_csv_path=HUTUBS_DIR / "AntrhopometricMeasures.csv",
+    val_sub_idx=1,
+    pad_size=10
+)
 
 
 def collate_fn(batch):
