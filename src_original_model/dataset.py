@@ -132,12 +132,12 @@ class HUTUBSDataset(Dataset):
             return self.leave_out_subject
 
 
-hutubs_dataset = HUTUBSDataset(
-    hrtf_directory=HUTUBS_DIR / "HRIRs",
-    anthro_csv_path=HUTUBS_DIR / "AntrhopometricMeasures.csv",
-    val_sub_idx=1,
-    pad_size=10
-)
+# hutubs_dataset = HUTUBSDataset(
+#     hrtf_directory=HUTUBS_DIR / "HRIRs",
+#     anthro_csv_path=HUTUBS_DIR / "AntrhopometricMeasures.csv",
+#     val_sub_idx=1,
+#     pad_size=10
+# )
 
 
 def collate_fn(batch):
