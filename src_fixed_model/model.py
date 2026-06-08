@@ -19,7 +19,7 @@ import torch.nn.functional as F
 
 
 class DiffusionModel:
-    def __init__(self, noise_steps=600, beta_start=0.0001, beta_end=0.02, device="cuda"):
+    def __init__(self, noise_steps=300, beta_start=0.0001, beta_end=0.02, device="cuda"):
         self.noise_steps = noise_steps
         self.beta_start  = beta_start
         self.beta_end    = beta_end
