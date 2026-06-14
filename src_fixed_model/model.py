@@ -260,8 +260,9 @@ class EMA:
                 param.data.copy_(self.shadow[name].data)
 
     def ema_copy(self, module):
-        module_copy = type(module)(module.config).to(module.config.device)
-        module_copy.load_state_dict(module.state_dict())
+        # NOTE: UNet does not use a config object; deep-copy the module instead.
+        import copy
+        module_copy = copy.deepcopy(module)
         self.ema(module_copy)
         return module_copy
 
