@@ -15,6 +15,9 @@ All fixes vs original juancaudio20 code
 10.  subj_2 misalignment               -> fixed in dataset.py (dict lookup)
 11.  alpha decay kills energy loss      -> decay changed to 0.95 (configurable)
 12.  TensorBoard writer not closed      -> writer.close() at end of every fold
+13.  Right-ear inference used wrong DOA label (BUG FIX) -> build_mirror_lookup()
+     constructs a point_idx → mirrored_point_idx map from SOFA source positions
+     so the right-ear backward pass is conditioned on the correct mirrored azimuth.
 
 Left-ear + mirrored-right augmentation
 =======================================
@@ -22,9 +25,10 @@ M1.  Model now trained on left ears only (in_channels=1, out_channels=1).
 M2.  Right-ear HRIRs are mirrored in azimuth and added as synthetic left-ear
      samples, doubling the effective training set size.
 M3.  Training loop uses batch['hrtf_mono'] (B, 1, L) instead of (B, 2, L).
-M4.  Validation & inference still compute binaural LSD by running the model
-     twice: once for the genuine left ear (hrtf_l) and once for the mirrored
-     right ear, then un-mirroring the prediction back to the right ear.
+M4.  Validation & inference compute binaural LSD by running the model twice:
+       - Left ear:  conditioned on original point label
+       - Right ear: conditioned on azimuth-MIRRORED point label (fix #13),
+                    i.e. the point index whose azimuth = -az (mod 360).
 M5.  hrir2hrtf / error_freq_binaural in utils.py are unchanged; binaural eval
      is reconstructed from two mono forward passes.
 
@@ -47,6 +51,7 @@ import scipy.io
 from datetime import datetime
 
 from torch.utils.tensorboard import SummaryWriter
+from pysofaconventions import SOFAFile
 
 from dataset import (HUTUBSDataset, HUTUBSTrainDataset, HUTUBSValDataset,
                      collate_fn, EXCLUDED_SUBJECTS, build_5fold_splits)
@@ -95,6 +100,81 @@ args = parser.parse_args()
 # ---------------------------------------------------------------------------
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
+
+# ---------------------------------------------------------------------------
+# Build azimuth-mirror lookup table  (fix #13)
+# ---------------------------------------------------------------------------
+
+def build_mirror_lookup(data_dir, az_tol_deg=5.0, el_tol_deg=2.0):
+    """
+    Build a tensor `mirror_lut` of shape (440,) where mirror_lut[i] is the
+    point index j whose azimuth is closest to -az_i (mod 360) at the same
+    elevation as point i.
+
+    The lookup is built from the source positions of the first valid SOFA file
+    (all HUTUBS subjects share the same 440-point measurement grid).
+
+    Parameters
+    ----------
+    data_dir    : path to the folder containing pp*.sofa files
+    az_tol_deg  : maximum azimuth error (degrees) to accept a mirror match
+    el_tol_deg  : maximum elevation error (degrees) to accept a mirror match
+
+    Returns
+    -------
+    mirror_lut : torch.LongTensor  shape (440,)
+                 mirror_lut[i] == i if no valid mirror found (safe fallback)
+    """
+    # Find first valid subject file
+    sofa_path = None
+    for idx in range(96):
+        if idx not in EXCLUDED_SUBJECTS:
+            candidate = os.path.join(data_dir, f'pp{idx + 1}_HRIRs_measured.sofa')
+            if os.path.exists(candidate):
+                sofa_path = candidate
+                break
+    if sofa_path is None:
+        raise RuntimeError("No valid SOFA file found in data_dir for mirror lookup.")
+
+    sofa      = SOFAFile(sofa_path, 'r')
+    positions = sofa.getVariableValue('SourcePosition')  # (440, 3): az, el, r
+    azimuths  = positions[:, 0].astype(np.float64)       # degrees, [0, 360)
+    elevations = positions[:, 1].astype(np.float64)
+
+    n_points  = len(azimuths)
+    lut       = np.arange(n_points, dtype=np.int64)      # default: identity
+
+    for i in range(n_points):
+        az_i  = azimuths[i]
+        el_i  = elevations[i]
+        az_mirror = (-az_i) % 360.0
+
+        # Angular distance in azimuth (handle wrap-around)
+        az_diff = np.abs(azimuths - az_mirror)
+        az_diff = np.minimum(az_diff, 360.0 - az_diff)
+
+        el_diff = np.abs(elevations - el_i)
+
+        # Candidate: same elevation, closest mirrored azimuth
+        candidates = np.where(el_diff <= el_tol_deg)[0]
+        if len(candidates) == 0:
+            # Relax elevation tolerance and take nearest overall
+            candidates = np.arange(n_points)
+
+        best = candidates[np.argmin(az_diff[candidates])]
+
+        if az_diff[best] <= az_tol_deg:
+            lut[i] = best
+        # else: keep identity fallback (lut[i] = i)
+
+    mirror_lut = torch.from_numpy(lut).long()
+    print(f"  Mirror LUT built from {sofa_path} ({n_points} points). "
+          f"Identity fallbacks: {int((mirror_lut == torch.arange(n_points)).sum().item())}")
+    return mirror_lut
+
+
+print("Building azimuth-mirror lookup table …")
+mirror_lut = build_mirror_lookup(DATA_DIR)   # shape (440,), on CPU
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -286,7 +366,10 @@ for fold_offset, fold in enumerate(tqdm.tqdm(folds_to_run, desc='5-Fold CV')):
     writer.close()
 
     # ---- 5. Inference on held-out subjects --------------------------------
-    # M4: run model twice per point — once for left ear, once for mirrored right.
+    # M4: run model twice per point:
+    #   Left ear  → conditioned on original point label
+    #   Right ear → conditioned on MIRRORED point label (fix #13)
+    #               mirror_lut[point_idx] gives the index whose azimuth = -az (mod 360)
     print(f"  Running inference for fold {fold_idx} ({len(val_subjects)} subjects) …")
 
     unet_inf = UNet(in_channels=1, out_channels=1,
@@ -295,36 +378,45 @@ for fold_offset, fold in enumerate(tqdm.tqdm(folds_to_run, desc='5-Fold CV')):
     torch.manual_seed(16)
     unet_inf.eval()
 
+    # Move LUT to device for indexing
+    mirror_lut_dev = mirror_lut.to(device)
+
     # Collect per-subject results so we can save per-subject .mat files
-    # val_data items all have subject_id; group by it.
     subject_preds = {}   # subject_id → {'pred_l', 'pred_r', 'gt_l', 'gt_r'}
 
     with torch.inference_mode():
         for data in val_loader:
-            head_meas  = data['head_measurements'].float().to(device)
-            ear_meas   = data['ear_measurements'].float().to(device)
-            label      = data['point'].to(device)
-            subject_ids = data['subject_id']            # (B,) LongTensor
+            head_meas   = data['head_measurements'].float().to(device)
+            ear_meas    = data['ear_measurements'].float().to(device)
+            label       = data['point'].to(device)          # (B,) original point indices
+            subject_ids = data['subject_id']                # (B,) LongTensor
 
-            # --- Left-ear pass ---
-            gt_l      = data['hrtf_l'].to(device).float()   # (B, 1, L)
-            L_padded  = gt_l.shape[2]
-            noise_l   = torch.randn((gt_l.shape[0], 1, L_padded), device=device)
-            pred_l    = diffusion_model.backward(
+            # Mirrored point label: azimuth-negated counterpart for each point (fix #13)
+            label_mirrored = mirror_lut_dev[label]          # (B,) mirrored point indices
+
+            # --- Left-ear pass (original DOA label) ---
+            gt_l     = data['hrtf_l'].to(device).float()   # (B, 1, L)
+            L_padded = gt_l.shape[2]
+            noise_l  = torch.randn((gt_l.shape[0], 1, L_padded), device=device)
+            pred_l   = diffusion_model.backward(
                 x=noise_l, model=unet_inf,
                 labels=label, head_embedding=head_meas, ears_embedding=ear_meas,
             )   # (B, 1, L)
 
-            # --- Mirrored-right-ear pass ---
-            # Feed the right HRIR channel through the model as if it were a left ear
-            gt_r_raw  = data['hrtf_r'].to(device).float()   # (B, 1, L)  right ear HRIR
-            noise_r   = torch.randn_like(gt_r_raw)
-            # Mirrored azimuth is encoded implicitly — model just sees a left-ear-like
-            # waveform; we generate the prediction as we would for a left ear.
+            # --- Right-ear pass (MIRRORED DOA label) ---
+            # The model is trained on left ears only.  To generate a right-ear
+            # HRIR at azimuth θ, we ask the model to generate a left-ear HRIR
+            # at azimuth -θ (i.e. the mirror image position), which is
+            # physically equivalent by bilateral head symmetry.
+            # label_mirrored carries the correct point index for -θ (fix #13).
+            gt_r_raw = data['hrtf_r'].to(device).float()   # (B, 1, L)
+            noise_r  = torch.randn_like(gt_r_raw)
             pred_r_mirrored = diffusion_model.backward(
                 x=noise_r, model=unet_inf,
-                labels=label, head_embedding=head_meas, ears_embedding=ear_meas,
-            )   # (B, 1, L) — predicted "left ear" for the mirrored azimuth
+                labels=label_mirrored,                      # ← FIXED: mirrored azimuth
+                head_embedding=head_meas,
+                ears_embedding=ear_meas,
+            )   # (B, 1, L) — left-ear prediction at -θ == right-ear prediction at θ
 
             if torch.isnan(pred_l).any() or torch.isnan(pred_r_mirrored).any():
                 print(f"  WARNING: NaN in backward output for fold {fold_idx}, skipping batch")
@@ -388,15 +480,15 @@ for fold_offset, fold in enumerate(tqdm.tqdm(folds_to_run, desc='5-Fold CV')):
         scipy.io.savemat(
             os.path.join(RESULTS_DIR, 'mat', f'fold{fold_idx}_sub{sid}_results.mat'),
             {
-                f'sub_{sid}_pred_L':       pred_l_cat[:, 0, :].numpy(),
-                f'sub_{sid}_pred_R':       pred_r_cat[:, 0, :].numpy(),
-                f'sub_{sid}_gt_L':         gt_l_cat[:, 0, :].numpy(),
-                f'sub_{sid}_gt_R':         gt_r_cat[:, 0, :].numpy(),
+                f'sub_{sid}_pred_L':        pred_l_cat[:, 0, :].numpy(),
+                f'sub_{sid}_pred_R':        pred_r_cat[:, 0, :].numpy(),
+                f'sub_{sid}_gt_L':          gt_l_cat[:, 0, :].numpy(),
+                f'sub_{sid}_gt_R':          gt_r_cat[:, 0, :].numpy(),
                 f'sub_{sid}_pred_denorm_L': pred_l_denorm[:, 0, :].numpy(),
                 f'sub_{sid}_pred_denorm_R': pred_r_denorm[:, 0, :].numpy(),
-                f'sub_{sid}_gt_denorm_L':  gt_l_denorm[:, 0, :].numpy(),
-                f'sub_{sid}_gt_denorm_R':  gt_r_denorm[:, 0, :].numpy(),
-                f'sub_{sid}_LSD_binaural': lsd,
+                f'sub_{sid}_gt_denorm_L':   gt_l_denorm[:, 0, :].numpy(),
+                f'sub_{sid}_gt_denorm_R':   gt_r_denorm[:, 0, :].numpy(),
+                f'sub_{sid}_LSD_binaural':  lsd,
             }
         )
 
