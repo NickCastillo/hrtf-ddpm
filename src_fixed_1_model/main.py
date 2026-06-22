@@ -48,6 +48,7 @@ import numpy as np
 import torch
 import tqdm
 import scipy.io
+from torch.utils.tensorboard import SummaryWriter
 
 from dataset import HUTUBSDataset, collate_fn, EXCLUDED_SUBJECT_IDS, N_SOFA_FILES
 from model import DiffusionModel, UNet
@@ -220,6 +221,11 @@ if args.training:
         model_path      = os.path.join(fold_dir, 'model.pt')
         noise_plot_path = os.path.join(fold_dir, 'noise_distribution.png')
 
+        # TensorBoard writer for this fold.
+        # View with: %tensorboard --logdir "{results_dir}/runs"
+        runs_dir = os.path.join(args.results_dir, 'runs', f'fold_{fold_k}')
+        writer = SummaryWriter(log_dir=runs_dir)
+
         # ---- Training loop ----
         best_val_loss    = float('inf')
         early_stop_count = 0
@@ -293,6 +299,9 @@ if args.training:
             mean_train = np.mean(train_losses)
             mean_val   = np.mean(val_losses)
 
+            writer.add_scalar('Loss/train', mean_train, epoch)
+            writer.add_scalar('Loss/val',   mean_val,   epoch)
+
             if args.verbose or epoch % 50 == 0:
                 print(f"  Epoch {epoch:4d} | Train {mean_train:.6f} | "
                       f"Val {mean_val:.6f} | "
@@ -318,6 +327,7 @@ if args.training:
                     break
 
         print(f"Fold {fold_k} training complete. Best val loss: {best_val_loss:.6f}")
+        writer.close()
 
         # ---- Inference on this fold's test set ----
         print(f"Running inference on fold {fold_k} test subjects…")
@@ -395,6 +405,11 @@ if args.training:
         fold_mean_v2 = float(np.mean(fold_lsd_v2))
         all_fold_lsd_v1.append(fold_mean_v1)
         all_fold_lsd_v2.append(fold_mean_v2)
+
+        # Log fold-level LSD so it sits alongside the loss curves in TensorBoard.
+        writer.add_scalar('LSD/v1_paper',     fold_mean_v1, fold_k)
+        writer.add_scalar('LSD/v2_corrected', fold_mean_v2, fold_k)
+        writer.close()
 
         print(f"Fold {fold_k} mean LSD — v1: {fold_mean_v1:.3f} dB | "
               f"v2: {fold_mean_v2:.3f} dB")

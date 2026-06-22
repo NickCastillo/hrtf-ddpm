@@ -1,14 +1,12 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import os
-import scipy
-import scipy.io
+
 
 def plot_noise_distribution(noise, predicted_noise,epoch,plot_path=None):
-    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(18, 4)) 
+    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(18, 4))  # Create three subplots
 
-    # Plot Ground Truth Noise
+    # Plot GT Noise
     axes[0].plot(noise.cpu().numpy()[0, 0], label='GT Noise L', linewidth=0.5, marker='o', markersize=1)
     axes[0].plot(noise.cpu().numpy()[0, 1], label='GT Noise R', linewidth=0.5, marker='o', markersize=1)
     axes[0].grid()
@@ -32,80 +30,63 @@ def plot_noise_distribution(noise, predicted_noise,epoch,plot_path=None):
         plt.savefig(plot_path)
         plt.close()
 
+def nmse(hrir_test, hrir_gen):
+
+    sq_error_left = torch.mean((hrir_test[0] - hrir_gen[0]) ** 2)
+    sq_error_right = torch.mean((hrir_test[1] - hrir_gen[1]) ** 2)
+
+    power_left = torch.mean(hrir_test[0] ** 2)
+    power_right = torch.mean(hrir_test[1] ** 2)
+
+    nmse_left = sq_error_left / power_left
+    nmse_right = sq_error_right / power_right
+
+    overall_nmse = (nmse_left + nmse_right) / 2
+
+    return overall_nmse
 
 
-def plot_hrir(hrir_test, hrir_pred, position, id, plot_path):
+def lsd(hrir_test, hrir_gen, points,sr, plot=False):
 
-    plt.figure(figsize=(14, 5))
-    plt.plot(hrir_test[0], label='Sample', linestyle='dashed')
-    plt.plot(hrir_pred[0], label='Predicted')
-    plt.grid(True)
-    plt.legend()
-    plt.title(f'Left HRIR position: {position}')
-    plt.xlabel('Sample Idex')
-    plt.ylabel('Amplitude')
-    plt.savefig(plot_path)
-    plt.close()
-    
-def hrir2hrtf(hrir_test, hrir_pred, id, plot_path):
+    hrtf_array1 = []
+    hrtf_array2 = []
 
-    hrtf_l_test = np.fft.fft(hrir_test[:,0])
-    hrtf_l_pred = np.fft.fft(hrir_pred[:,0])
+    for point in range(points):
+        hrtf_test = np.fft.fft(hrir_test[point][0])
+        hrtf_gen = np.fft.fft(hrir_gen[point][0])
+        K = np.fft.fftfreq(len(hrtf_test), 1 / sr)
 
-    critical_bands = np.array(
-        [200, 300, 400, 510, 630, 770, 920, 1080, 1270, 1480, 1720, 2000, 2320, 2700,
-         3150, 3700, 4400, 5300, 6400, 7700, 9500, 12000, 15500])
+        hrtf_array1.append(hrtf_gen)
+        hrtf_array2.append(hrtf_test)
 
-    hrtf_l_test_db = 20 * np.log10(np.abs(hrtf_l_test))
-    hrtf_l_pred_db = 20 * np.log10(np.abs(hrtf_l_pred))
 
-    K = np.fft.fftfreq(len(hrtf_l_test[0]), 1 / 44100)
+    H = np.array(hrtf_array1)
+    H_hat = np.array(hrtf_array2)
 
-    nearest_indices = np.array([np.abs(K - freq).argmin() for freq in critical_bands])
-    hrtf_l_test_db_1 = hrtf_l_test_db[:,nearest_indices]
-    hrtf_l_pred_db_1 = hrtf_l_pred_db[:,nearest_indices]
+    log_ratio = 20 * np.log10(np.abs(hrtf_array1) / np.abs(hrtf_array2))
 
-    positions = np.random.randint(36, size=10).astype(int)
+    squared_diffs = np.sum(log_ratio ** 2) / (points * len(K))
+    LSD = np.sqrt(squared_diffs)
+    '''
+    cumulative_LSD = np.zeros(K)
+    cumulative_LSD[0] = np.sqrt(np.sum(log_ratio[:, :1] ** 2) / (points * 1))
 
-    directory = f''
-    os.makedirs(directory, exist_ok=True)
+    for i in range(1, K):
+        log_ratio_i = log_ratio[:, :i + 1]
+        squared_diffs_i = np.sum(log_ratio_i ** 2) / (points * (i + 1))
+        cumulative_LSD[i] = np.sqrt(squared_diffs_i)
 
-    for position in positions:
+    frequency_axis = np.arange(1, K + 1) * (44100 / (2 * K))
 
-        plt.figure(figsize=(14, 5))
-        plt.plot(K[:len(K) // 2], hrtf_l_test_db[position, :len(hrtf_l_test_db[position]) // 2], label='Test')
-        plt.plot(K[:len(K) // 2], hrtf_l_pred_db[position, :len(hrtf_l_pred_db[position]) // 2], label='Predicted')
-        plt.title(f'Left HRTF source position: {position}')
-        plt.xlabel('Frequency (Hz)')
-        plt.ylabel('Magnitude (dB)')
-        plt.xlim(20, 20000)
+    if plot:
+        plt.figure(figsize=(10, 6))
+        plt.plot(frequency_axis, cumulative_LSD, linewidth=0.5)
+        plt.title('Cumulative LSD')
+        plt.xlabel('Frequency [Hz]')
+        plt.ylabel('Cumulative LSD [dB]')
+        plt.grid(True)
         plt.xscale('log')
-        plt.grid(True)
-        plt.legend()
-        plt.savefig(directory + f'/sub_{id}/hrtf_l_pos_{position}_all.jpg')
-        plt.close()
-
-        plt.figure(figsize=(14, 5))
-        plt.plot(hrir_pred[position, 0], label='Predicted')
-        plt.plot(hrir_test[position,0], label='Sample', linestyle='dashed')
-        plt.grid(True)
-        plt.legend()
-        plt.title(f'Left HRIR position: {position}')
-        plt.xlabel('Sample Idex')
-        plt.ylabel('Amplitude')
-        plt.savefig(directory + f'/sub_{id}/hrir_l_pos_{position}.jpg')
-        plt.close()
-
-    return hrtf_l_pred_db_1, hrtf_l_test_db_1
-
-
-def error_freq(hrir_pred, hrir_test):
-
-    ratio = (hrir_pred.float() - hrir_test.float()) ** 2
-
-    return ratio
-
-
-def energy_loss(predicted, target):
-    return torch.sum((torch.sum(predicted ** 2) - torch.sum(target ** 2)) ** 2)
+        plt.show()
+    '''
+    return LSD
 
