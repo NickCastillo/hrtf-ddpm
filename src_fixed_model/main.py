@@ -2,7 +2,7 @@
 main.py — Training and inference for HRTF personalisation DDPM.
 
 Training (k-fold cross-validation):
-    python main.py --training --folds 10 --epochs 1000 --batch_size 64 \
+    python main.py --training --folds 5 --epochs 1000 --batch_size 64 \
                    --results_dir results/
 
 Inference (after training all folds):
@@ -16,27 +16,25 @@ For each fold k:
   - Val   = subjects in fold (k+1) % K
   - Train = all remaining subjects (K-2 folds), with ear-mirroring augmentation
 
-Each fold trains an independent model, saved to results_dir/fold_{k}/model.pt.
-LSD is evaluated per fold and aggregated into a mean ± std across folds.
+Optimizer (paper Section IV-A)
+-------------------------------
+Adam, lr=0.001, StepLR decay of 20% every 100 epochs.
+1000 epochs, early stopping with patience=200.
 
-Ear-mirroring augmentation
---------------------------
-Enabled on the training set only (augment=True). Each (subject, DOA) item gets
-a mirrored counterpart: HRIR channels swapped [L,R]→[R,L], DOA reflected in
-azimuth via a pre-built LUT, anthropometrics unchanged. Doubles training set size.
-Never applied to val or test sets.
+LR default is 1e-3 (paper value). Previous version used 5e-5 (too low).
 
-LSD variants
-------------
-  v1 — paper-replicating: K=44 bands, 0–15 kHz (paper Eq. 9, Section IV-B)
-  v2 — corrected: 87 bins, ~172 Hz–15 kHz (excludes DC, same upper limit)
+Anthropometric features
+-----------------------
+All 37 available HUTUBS features are used:
+  13 head/torso (x1-x9, x12, x14, x16, x17) + 24 ear (12L + 12R pinna).
+The paper references CIPIC N=27 but HUTUBS provides a different set;
+see dataset.py for the full explanation.
 
-Changes vs. previous version:
-  [NEW] K-fold cross-validation replaces single 70/20/10 split.
-  [NEW] --folds argument (default 10).
-  [NEW] Ear-mirroring augmentation on training sets (augment=True).
-  [NEW] Per-fold model saving and result aggregation.
-  [NEW] Mean ± std LSD reported across all folds.
+Architecture (model.py)
+------------------------
+Matches arxiv 2501.02871 Section III-C:
+  sequence_channels=(4,8,16,32,64), self-attention after each encoder block,
+  second conv with no activation in each Block, binaural output (audio_channels=2).
 """
 
 import os
@@ -63,7 +61,7 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+print(f'Using device: {device}')
 
 
 # ---------------------------------------------------------------------------
@@ -71,30 +69,31 @@ print(f"Using device: {device}")
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description='HRTF DDPM — k-fold training / inference')
 parser.add_argument('--training',            action='store_true')
-parser.add_argument('--folds',               type=int,   default=10,
-                    help='Number of cross-validation folds (default: 10)')
+parser.add_argument('--folds',               type=int,   default=5,
+                    help='Number of cross-validation folds (default: 5)')
 parser.add_argument('--epochs',              type=int,   default=1000)
 parser.add_argument('--batch_size',          type=int,   default=64)
-parser.add_argument('--lr',                  type=float, default=5e-5)
+parser.add_argument('--lr',                  type=float, default=1e-3,
+                    help='Initial learning rate (paper: 0.001)')
 parser.add_argument('--early_stop_patience', type=int,   default=200)
-parser.add_argument('--results_dir',         type=str,   default='results',
-                    help='Root directory for all fold outputs')
+parser.add_argument('--results_dir',         type=str,   default='results')
 parser.add_argument('--hrtf_directory',      type=str,
-                    default='/nas/home/jalbarracin/datasets/HUTUBS/HRIRs')
+                    default='/content/drive/MyDrive/hrtf-ddpm/HUTUBS/HRIRs')
 parser.add_argument('--anthro_csv_path',     type=str,
-                    default='/nas/home/jalbarracin/datasets/HUTUBS/AntrhopometricMeasures.csv')
+                    default='/content/drive/MyDrive/hrtf-ddpm/HUTUBS/AntrhopometricMeasures.csv')
 parser.add_argument('--p_uncond',            type=float, default=0.0,
                     help='CFG dropout probability. Paper does not use CFG (default=0.0).')
-parser.add_argument('--timesteps',           type=int,   default=600)
+parser.add_argument('--timesteps',           type=int,   default=600,
+                    help='Diffusion steps (paper: 600)')
 parser.add_argument('--verbose',             action='store_true')
 args = parser.parse_args()
 
 os.makedirs(args.results_dir, exist_ok=True)
 
 if args.verbose:
-    print(f"folds={args.folds}, timesteps={args.timesteps}, p_uncond={args.p_uncond}, "
-          f"lr={args.lr}, batch_size={args.batch_size}, "
-          f"early_stop={args.early_stop_patience}")
+    print(f'folds={args.folds}, timesteps={args.timesteps}, lr={args.lr}, '
+          f'batch_size={args.batch_size}, early_stop={args.early_stop_patience}, '
+          f'p_uncond={args.p_uncond}')
 
 
 # ---------------------------------------------------------------------------
@@ -104,25 +103,38 @@ all_subject_ids = sorted(
     sid for sid in range(1, N_SOFA_FILES + 1)
     if sid not in EXCLUDED_SUBJECT_IDS
 )
-n_subjects = len(all_subject_ids)  # 93
+n_subjects = len(all_subject_ids)   # 93
 
 K = args.folds
 
-# Partition subjects into K folds as evenly as possible.
-# fold_assignments[k] = list of subject IDs in fold k.
 fold_assignments = [[] for _ in range(K)]
 for i, sid in enumerate(all_subject_ids):
     fold_assignments[i % K].append(sid)
 
 if args.verbose:
     for k, subjects in enumerate(fold_assignments):
-        print(f"  Fold {k}: {len(subjects)} subjects — {subjects[:3]}…")
+        print(f'  Fold {k}: {len(subjects)} subjects — {subjects[:3]}…')
 
 
 # ---------------------------------------------------------------------------
-# Diffusion model (shared across folds — only schedule, no weights)
+# Diffusion schedule (shared across folds — schedule only, no weights)
 # ---------------------------------------------------------------------------
 diffusion_model = DiffusionModel(timesteps=args.timesteps)
+
+
+# ---------------------------------------------------------------------------
+# Helper: build UNet with consistent hyperparameters
+# ---------------------------------------------------------------------------
+def make_unet():
+    """Instantiate the U-Net matching the paper architecture."""
+    return UNet(
+        audio_channels    = 2,                      # binaural
+        time_embedding_dims = 128,                  # paper unspecified; kept small
+        labels            = 440,                    # HUTUBS DOA positions
+        head_embedding    = True,
+        ears_embedding    = True,
+        sequence_channels = (4, 8, 16, 32, 64),    # paper Section III-C
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -130,19 +142,18 @@ diffusion_model = DiffusionModel(timesteps=args.timesteps)
 # ---------------------------------------------------------------------------
 if args.training:
 
-    # Accumulators for cross-fold summary.
     all_fold_lsd_v1 = []
     all_fold_lsd_v2 = []
 
     for fold_k in range(K):
         print(f"\n{'='*60}")
-        print(f"FOLD {fold_k + 1} / {K}")
+        print(f'FOLD {fold_k + 1} / {K}')
         print(f"{'='*60}")
 
         fold_dir = os.path.join(args.results_dir, f'fold_{fold_k}')
         os.makedirs(fold_dir, exist_ok=True)
 
-        # Test: fold k. Val: fold (k+1) % K. Train: everything else.
+        # Test: fold k.  Val: fold (k+1)%K.  Train: everything else.
         test_subject_ids  = fold_assignments[fold_k]
         val_subject_ids   = fold_assignments[(fold_k + 1) % K]
         train_subject_ids = [
@@ -152,18 +163,17 @@ if args.training:
         ]
 
         if args.verbose:
-            print(f"  Train: {len(train_subject_ids)} subjects")
-            print(f"  Val:   {len(val_subject_ids)} subjects — {val_subject_ids}")
-            print(f"  Test:  {len(test_subject_ids)} subjects — {test_subject_ids}")
+            print(f'  Train: {len(train_subject_ids)} subjects')
+            print(f'  Val:   {len(val_subject_ids)} subjects — {val_subject_ids}')
+            print(f'  Test:  {len(test_subject_ids)} subjects — {test_subject_ids}')
 
-        # ---- Datasets ----
-        # Training set: augment=True enables ear-mirroring.
-        # Val and test: augment=False — always evaluated on real, unmodified HRIRs.
+        # Training set: augment=True enables ear-mirroring (doubles set size).
+        # Val / test: augment=False — always evaluated on real unmodified HRIRs.
         train_dataset = HUTUBSDataset(
             hrtf_directory  = args.hrtf_directory,
             anthro_csv_path = args.anthro_csv_path,
             subject_ids     = train_subject_ids,
-            augment         = True,   # ear-mirroring on training set only
+            augment         = True,
         )
 
         norm_kwargs = dict(
@@ -193,40 +203,41 @@ if args.training:
 
         if args.verbose:
             real_train = len(train_subject_ids) * 440
-            print(f"  Train items: {len(train_dataset)} "
-                  f"({real_train} real + {len(train_dataset) - real_train} mirrored)")
-            print(f"  Val items:   {len(val_dataset)}")
-            print(f"  Test items:  {len(test_dataset)}")
+            print(f'  Train items: {len(train_dataset)} '
+                  f'({real_train} real + {len(train_dataset) - real_train} mirrored)')
+            print(f'  Val items:   {len(val_dataset)}')
+            print(f'  Test items:  {len(test_dataset)}')
 
         train_loader = torch.utils.data.DataLoader(
             train_dataset, batch_size=args.batch_size,
-            shuffle=True, num_workers=4, drop_last=True, collate_fn=collate_fn,
+            shuffle=True, num_workers=4, pin_memory=True,
+            drop_last=True, collate_fn=collate_fn,
         )
         val_loader = torch.utils.data.DataLoader(
             val_dataset, batch_size=args.batch_size,
-            shuffle=False, num_workers=4, drop_last=False, collate_fn=collate_fn,
+            shuffle=False, num_workers=4, pin_memory=True,
+            drop_last=False, collate_fn=collate_fn,
         )
 
-        # ---- Fresh model for each fold ----
-        unet = UNet(
-            audio_channels = 2,
-            labels         = 440,
-            head_embedding = True,
-            ears_embedding = True,
-        )
-        unet.to(device)
+        # Fresh model for each fold.
+        unet = make_unet().to(device)
+
+        # Paper optimizer: Adam lr=0.001, 20% decay every 100 epochs.
         optimizer = torch.optim.Adam(unet.parameters(), lr=args.lr)
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=100, gamma=0.8
+        )
 
         model_path      = os.path.join(fold_dir, 'model.pt')
         noise_plot_path = os.path.join(fold_dir, 'noise_distribution.png')
 
-        # ---- Training loop ----
         best_val_loss    = float('inf')
         early_stop_count = 0
 
         for epoch in tqdm.tqdm(range(args.epochs),
                                 desc=f'Fold {fold_k} training', unit='epoch'):
 
+            # ---- Training ----
             unet.train()
             train_losses = []
 
@@ -237,13 +248,14 @@ if args.training:
                 ears_measurements = data['ear_measurements'].to(device)
 
                 t = torch.randint(
-                    0, diffusion_model.timesteps, (batch.shape[0],), dtype=torch.long
-                ).to(device)
+                    0, diffusion_model.timesteps, (batch.shape[0],),
+                    dtype=torch.long, device=device
+                )
 
                 batch_noisy, noise = diffusion_model.forward(batch, t, device)
                 batch_noisy = batch_noisy.float()
 
-                # CFG dropout: off by default. Paper does not use CFG.
+                # CFG dropout: disabled by default — paper does not use CFG.
                 if args.p_uncond > 0.0 and random.random() < args.p_uncond:
                     label             = None
                     head_measurements = None
@@ -256,13 +268,13 @@ if args.training:
                     ears_embedding = ears_measurements,
                 )
 
-                train_loss = torch.nn.functional.l1_loss(noise, predicted_noise)
+                loss = torch.nn.functional.l1_loss(noise, predicted_noise)
                 optimizer.zero_grad()
-                train_loss.backward()
+                loss.backward()
                 optimizer.step()
-                train_losses.append(train_loss.item())
+                train_losses.append(loss.item())
 
-            # ---- Validation loop ----
+            # ---- Validation (noise-prediction loss, not full denoising) ----
             unet.eval()
             val_losses = []
 
@@ -274,8 +286,9 @@ if args.training:
                     ears_measurements = data['ear_measurements'].to(device)
 
                     t = torch.randint(
-                        0, diffusion_model.timesteps, (batch.shape[0],), dtype=torch.long
-                    ).to(device)
+                        0, diffusion_model.timesteps, (batch.shape[0],),
+                        dtype=torch.long, device=device
+                    )
 
                     batch_noisy, noise = diffusion_model.forward(batch, t, device)
                     batch_noisy = batch_noisy.float()
@@ -294,16 +307,17 @@ if args.training:
             mean_val   = np.mean(val_losses)
 
             if args.verbose or epoch % 50 == 0:
-                print(f"  Epoch {epoch:4d} | Train {mean_train:.6f} | "
-                      f"Val {mean_val:.6f} | "
-                      f"Patience {early_stop_count}/{args.early_stop_patience}")
+                print(f'  Epoch {epoch:4d} | Train {mean_train:.6f} | '
+                      f'Val {mean_val:.6f} | '
+                      f'Patience {early_stop_count}/{args.early_stop_patience} | '
+                      f'LR {scheduler.get_last_lr()[0]:.2e}')
 
             if mean_val < best_val_loss:
                 best_val_loss    = mean_val
                 early_stop_count = 0
                 torch.save(unet.state_dict(), model_path)
                 if args.verbose:
-                    print(f"  ✓ Saved (val {best_val_loss:.6f})")
+                    print(f'  ✓ Saved (val {best_val_loss:.6f})')
                 with torch.no_grad():
                     plot_noise_distribution(
                         noise.detach().cpu(),
@@ -314,13 +328,15 @@ if args.training:
             else:
                 early_stop_count += 1
                 if early_stop_count > args.early_stop_patience:
-                    print(f"  Early stopping at epoch {epoch}.")
+                    print(f'  Early stopping at epoch {epoch}.')
                     break
 
-        print(f"Fold {fold_k} training complete. Best val loss: {best_val_loss:.6f}")
+            scheduler.step()
+
+        print(f'Fold {fold_k} training complete. Best val loss: {best_val_loss:.6f}')
 
         # ---- Inference on this fold's test set ----
-        print(f"Running inference on fold {fold_k} test subjects…")
+        print(f'Running inference on fold {fold_k} test subjects…')
         unet.load_state_dict(torch.load(model_path, map_location=device))
         unet.eval()
 
@@ -340,10 +356,9 @@ if args.training:
 
             for item in items:
                 hrir_gt = item['hrtf']
-
-                head  = item['head_measurements'].unsqueeze(0).float().to(device)
-                ears  = item['ear_measurements'].unsqueeze(0).float().to(device)
-                label = torch.tensor(
+                head    = item['head_measurements'].unsqueeze(0).float().to(device)
+                ears    = item['ear_measurements'].unsqueeze(0).float().to(device)
+                label   = torch.tensor(
                     [item['measurement_point']], dtype=torch.long, device=device
                 )
 
@@ -364,7 +379,6 @@ if args.training:
 
                 pred_denorm = (audio_result[0].detach().cpu() * norm_std) + norm_mean
                 gt_denorm   = (hrir_gt * norm_std) + norm_mean
-
                 hrir_gt_list.append(gt_denorm.numpy())
                 hrir_pred_list.append(pred_denorm.numpy())
 
@@ -374,11 +388,10 @@ if args.training:
             fold_lsd_v1.append(lsd_v1)
             fold_lsd_v2.append(lsd_v2)
 
-            print(f"  Subject {subject_id:3d} | "
-                  f"LSD v1: {lsd_v1:.3f} dB [L={lsd_v1_l:.3f} R={lsd_v1_r:.3f}] | "
-                  f"LSD v2: {lsd_v2:.3f} dB")
+            print(f'  Subject {subject_id:3d} | '
+                  f'LSD v1: {lsd_v1:.3f} dB [L={lsd_v1_l:.3f} R={lsd_v1_r:.3f}] | '
+                  f'LSD v2: {lsd_v2:.3f} dB')
 
-            # Save per-subject results.
             scipy.io.savemat(
                 os.path.join(fold_dir, f'sub_{subject_id}_results.mat'),
                 {
@@ -396,16 +409,15 @@ if args.training:
         all_fold_lsd_v1.append(fold_mean_v1)
         all_fold_lsd_v2.append(fold_mean_v2)
 
-        print(f"Fold {fold_k} mean LSD — v1: {fold_mean_v1:.3f} dB | "
-              f"v2: {fold_mean_v2:.3f} dB")
+        print(f'Fold {fold_k} mean LSD — v1: {fold_mean_v1:.3f} dB | '
+              f'v2: {fold_mean_v2:.3f} dB')
 
-        # Save fold-level summary.
         scipy.io.savemat(
             os.path.join(fold_dir, 'fold_summary.mat'),
             {
-                'test_subject_ids': np.array(test_subject_ids),
-                'mean_lsd_v1':      fold_mean_v1,
-                'mean_lsd_v2':      fold_mean_v2,
+                'test_subject_ids':   np.array(test_subject_ids),
+                'mean_lsd_v1':        fold_mean_v1,
+                'mean_lsd_v2':        fold_mean_v2,
                 'per_subject_lsd_v1': np.array(fold_lsd_v1),
                 'per_subject_lsd_v2': np.array(fold_lsd_v2),
             }
@@ -413,34 +425,34 @@ if args.training:
 
     # ---- Cross-fold summary ----
     print(f"\n{'='*60}")
-    print(f"{K}-FOLD CROSS-VALIDATION SUMMARY")
+    print(f'{K}-FOLD CROSS-VALIDATION SUMMARY')
     print(f"{'='*60}")
-    print(f"LSD v1 (paper, K=44, 0-15 kHz): "
-          f"{np.mean(all_fold_lsd_v1):.3f} ± {np.std(all_fold_lsd_v1):.3f} dB")
-    print(f"LSD v2 (corrected, 87 bins):     "
-          f"{np.mean(all_fold_lsd_v2):.3f} ± {np.std(all_fold_lsd_v2):.3f} dB")
-    print(f"Per-fold v1: {[f'{x:.3f}' for x in all_fold_lsd_v1]}")
-    print(f"Per-fold v2: {[f'{x:.3f}' for x in all_fold_lsd_v2]}")
+    print(f'LSD v1 (paper, K=44, 0-15 kHz): '
+          f'{np.mean(all_fold_lsd_v1):.3f} ± {np.std(all_fold_lsd_v1):.3f} dB')
+    print(f'LSD v2 (corrected, 87 bins):     '
+          f'{np.mean(all_fold_lsd_v2):.3f} ± {np.std(all_fold_lsd_v2):.3f} dB')
+    print(f'Per-fold v1: {[f"{x:.3f}" for x in all_fold_lsd_v1]}')
+    print(f'Per-fold v2: {[f"{x:.3f}" for x in all_fold_lsd_v2]}')
 
     scipy.io.savemat(
         os.path.join(args.results_dir, 'cv_summary.mat'),
         {
-            'n_folds':           K,
-            'mean_lsd_v1':       float(np.mean(all_fold_lsd_v1)),
-            'std_lsd_v1':        float(np.std(all_fold_lsd_v1)),
-            'mean_lsd_v2':       float(np.mean(all_fold_lsd_v2)),
-            'std_lsd_v2':        float(np.std(all_fold_lsd_v2)),
-            'per_fold_lsd_v1':   np.array(all_fold_lsd_v1),
-            'per_fold_lsd_v2':   np.array(all_fold_lsd_v2),
+            'n_folds':          K,
+            'mean_lsd_v1':      float(np.mean(all_fold_lsd_v1)),
+            'std_lsd_v1':       float(np.std(all_fold_lsd_v1)),
+            'mean_lsd_v2':      float(np.mean(all_fold_lsd_v2)),
+            'std_lsd_v2':       float(np.std(all_fold_lsd_v2)),
+            'per_fold_lsd_v1':  np.array(all_fold_lsd_v1),
+            'per_fold_lsd_v2':  np.array(all_fold_lsd_v2),
         }
     )
 
 
 # ---------------------------------------------------------------------------
-# Inference-only mode: load saved fold models and re-run evaluation
+# Inference-only mode
 # ---------------------------------------------------------------------------
 else:
-    print("Inference mode: loading saved fold models from results_dir…")
+    print('Inference mode: loading saved fold models from results_dir…')
 
     all_fold_lsd_v1 = []
     all_fold_lsd_v2 = []
@@ -450,7 +462,7 @@ else:
         model_path = os.path.join(fold_dir, 'model.pt')
 
         if not os.path.exists(model_path):
-            print(f"  Fold {fold_k}: no model found at {model_path}, skipping.")
+            print(f'  Fold {fold_k}: no model at {model_path}, skipping.')
             continue
 
         test_subject_ids  = fold_assignments[fold_k]
@@ -460,8 +472,7 @@ else:
             if i != fold_k and i != (fold_k + 1) % K
         ]
 
-        # Load training stats from the training set for this fold.
-        # augment=False here — we only need the normalisation stats.
+        # Load training-set normalisation stats.
         train_dataset = HUTUBSDataset(
             hrtf_directory  = args.hrtf_directory,
             anthro_csv_path = args.anthro_csv_path,
@@ -484,8 +495,7 @@ else:
             **norm_kwargs,
         )
 
-        unet = UNet(audio_channels=2, labels=440,
-                    head_embedding=True, ears_embedding=True)
+        unet = make_unet()
         unet.load_state_dict(torch.load(model_path, map_location=device))
         unet.eval().to(device)
 
@@ -506,9 +516,9 @@ else:
 
             for item in items:
                 hrir_gt = item['hrtf']
-                head  = item['head_measurements'].unsqueeze(0).float().to(device)
-                ears  = item['ear_measurements'].unsqueeze(0).float().to(device)
-                label = torch.tensor(
+                head    = item['head_measurements'].unsqueeze(0).float().to(device)
+                ears    = item['ear_measurements'].unsqueeze(0).float().to(device)
+                label   = torch.tensor(
                     [item['measurement_point']], dtype=torch.long, device=device
                 )
                 L = hrir_gt.shape[-1]
@@ -532,9 +542,9 @@ else:
             fold_lsd_v1.append(lsd_v1)
             fold_lsd_v2.append(lsd_v2)
 
-            print(f"  Fold {fold_k} Sub {subject_id:3d} | "
-                  f"v1: {lsd_v1:.3f} dB [L={lsd_v1_l:.3f} R={lsd_v1_r:.3f}] | "
-                  f"v2: {lsd_v2:.3f} dB")
+            print(f'  Fold {fold_k} Sub {subject_id:3d} | '
+                  f'v1: {lsd_v1:.3f} dB [L={lsd_v1_l:.3f} R={lsd_v1_r:.3f}] | '
+                  f'v2: {lsd_v2:.3f} dB')
 
             scipy.io.savemat(
                 os.path.join(fold_dir, f'sub_{subject_id}_results.mat'),
@@ -552,9 +562,9 @@ else:
         fold_mean_v2 = float(np.mean(fold_lsd_v2))
         all_fold_lsd_v1.append(fold_mean_v1)
         all_fold_lsd_v2.append(fold_mean_v2)
-        print(f"Fold {fold_k} mean — v1: {fold_mean_v1:.3f} | v2: {fold_mean_v2:.3f}")
+        print(f'Fold {fold_k} mean — v1: {fold_mean_v1:.3f} | v2: {fold_mean_v2:.3f}')
 
     print(f"\n{'='*60}")
-    print(f"{K}-FOLD SUMMARY")
-    print(f"LSD v1: {np.mean(all_fold_lsd_v1):.3f} ± {np.std(all_fold_lsd_v1):.3f} dB")
-    print(f"LSD v2: {np.mean(all_fold_lsd_v2):.3f} ± {np.std(all_fold_lsd_v2):.3f} dB")
+    print(f'{K}-FOLD SUMMARY')
+    print(f'LSD v1: {np.mean(all_fold_lsd_v1):.3f} ± {np.std(all_fold_lsd_v1):.3f} dB')
+    print(f'LSD v2: {np.mean(all_fold_lsd_v2):.3f} ± {np.std(all_fold_lsd_v2):.3f} dB')

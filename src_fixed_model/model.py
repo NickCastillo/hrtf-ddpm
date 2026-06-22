@@ -1,20 +1,41 @@
 """
 model.py — Diffusion model (DDPM) and U-Net architecture for HRTF personalisation.
 
-Changes vs. original commit (1c54d54 / uploaded version):
-  [BUG] backward(): 'if t == 0' compared a Tensor to an int.  A non-empty Tensor
-        is always truthy in Python, so the else branch (adding noise) was NEVER
-        executed.  Every denoising step returned a deterministic mean — the model
-        could not explore the posterior.  Fixed to 'if t.item() == 0'.
-  [BUG] Block: self.bnorm2 and self.conv2 were defined but never called in
-        forward(), wasting parameters and misleading readers.  Removed.
-  [DESIGN] UNet: removed unused 'sequence_channels_rev = reversed(...)' line.
-  [DESIGN] Added docstrings throughout.
+Architecture matches arxiv 2501.02871 (Albarracin et al., ICASSP 2025) as closely
+as the HUTUBS dataset allows. Deviations from the paper are documented explicitly.
+
+U-Net architecture (Section III-C):
+  - sequence_channels = (4, 8, 16, 32, 64): five encoder/decoder scales.
+  - Each Block: (i) Conv1d+ReLU+BN, (ii) conditioning injections,
+                (iii) second Conv1d with NO activation, (iv) stride-2/transposed conv.
+  - SelfAttention (4 heads) after each ENCODER block.
+  - Binaural output: audio_channels=2 (left + right ear jointly).
+
+Anthropometric features (Section III-A):
+  The paper references CIPIC's N=27 features (17 head + 10 pinna). However,
+  HUTUBS provides a related but different set: 13 head/torso features (CIPIC
+  x1-x9, x12, x14, x16, x17 — missing x10, x11, x13, x15) and 12 pinna
+  features per ear (d1-d10 + theta1 + theta2, two extra vs CIPIC's d1-d8).
+  We use all 37 available HUTUBS features (13 head + 24 ear = 12L + 12R).
+  This is documented as a methodological note: the paper's N=27 claim is not
+  exactly reproducible from HUTUBS.
+
+Changes vs. src_fixed_model/model.py:
+  [ARCH] sequence_channels: (64,128,256,512,1024) → (4,8,16,32,64).
+         This was the cause of the ~26s/epoch slowdown (100× more parameters).
+  [ARCH] Block.conv2 (second conv, no activation) is now called in forward().
+         Previously defined but dead code — never executed.
+  [ARCH] Self-attention moved from decoder to encoder path (paper spec).
+  [ARCH] time_embedding_dims: 256 → 128 (restores the faster old model's value;
+         paper does not specify this hyperparameter).
+  [BUG]  backward(): t.item()==0 fix retained from previous session.
 """
 
-import torch
-from torch import nn
 import math
+
+import torch
+import torch.nn.functional as F
+from torch import nn
 
 
 # ---------------------------------------------------------------------------
@@ -27,14 +48,9 @@ class DiffusionModel:
 
     Parameters
     ----------
-    start_schedule : float
-        β at t=0.
-    end_schedule : float
-        β at t=T-1.
-    timesteps : int
-        Total number of diffusion steps T.
-        The paper used 600; the uploaded commit used 300.
-        Set this to match whichever run you are replicating.
+    start_schedule : float   β₀ (paper: 1e-4)
+    end_schedule   : float   β_T (paper: 0.02)
+    timesteps      : int     T   (paper: 600)
     """
 
     def __init__(self, start_schedule=0.0001, end_schedule=0.02, timesteps=600):
@@ -46,41 +62,34 @@ class DiffusionModel:
         self.alphas         = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
 
-    def forward(self, x_0, t, device="cpu"):
+    def forward(self, x_0, t, device='cpu'):
         """
-        DDPM forward (noising) process: q(x_t | x_0).
-        Returns (x_t, noise) where noise ~ N(0, I).
+        DDPM forward (noising): q(x_t | x_0) = sqrt(ᾱ_t)·x_0 + sqrt(1-ᾱ_t)·ε
+        Returns (x_t, ε).
         """
         noise = torch.randn_like(x_0)
-
-        sqrt_alphas_cumprod_t = self.get_index_from_list(
+        sqrt_alpha_cumprod_t = self.get_index_from_list(
             self.alphas_cumprod.sqrt(), t, x_0.shape
         )
-        sqrt_one_minus_alphas_cumprod_t = self.get_index_from_list(
+        sqrt_one_minus_alpha_cumprod_t = self.get_index_from_list(
             torch.sqrt(1.0 - self.alphas_cumprod), t, x_0.shape
         )
-
-        mean     = sqrt_alphas_cumprod_t.to(device)             * x_0.to(device)
-        variance = sqrt_one_minus_alphas_cumprod_t.to(device)   * noise.to(device)
-
-        return mean + variance, noise.to(device)
+        x_t = (sqrt_alpha_cumprod_t.to(device) * x_0.to(device)
+               + sqrt_one_minus_alpha_cumprod_t.to(device) * noise.to(device))
+        return x_t, noise.to(device)
 
     @torch.no_grad()
     def backward(self, x, t, model, **kwargs):
         """
-        DDPM backward (denoising) step: p(x_{t-1} | x_t).
+        One DDPM denoising step: p(x_{t-1} | x_t).
 
         Parameters
         ----------
-        x : Tensor  (B, C, L)   noisy signal at step t.
-        t : Tensor  (B,)        current timestep indices.
-        model : nn.Module       the noise-prediction U-Net.
-        **kwargs                passed through to model (labels, head_embedding, etc.)
+        x     : Tensor (B, C, L)   noisy signal at step t.
+        t     : Tensor (B,)        current timestep indices.
+        model : nn.Module          noise-prediction U-Net.
+        **kwargs                   forwarded to model (labels, head_embedding, etc.)
         """
-        labels          = kwargs.get('labels',          None)
-        head_embedding  = kwargs.get('head_embedding',  None)
-        ears_embedding  = kwargs.get('ears_embedding',  None)
-
         betas_t = self.get_index_from_list(self.betas, t, x.shape)
         sqrt_one_minus_alphas_cumprod_t = self.get_index_from_list(
             torch.sqrt(1.0 - self.alphas_cumprod), t, x.shape
@@ -89,34 +98,25 @@ class DiffusionModel:
             torch.sqrt(1.0 / self.alphas), t, x.shape
         )
 
-        predicted_noise = model(
-            x, t,
-            labels=labels,
-            head_embedding=head_embedding,
-            ears_embedding=ears_embedding,
-        )
+        predicted_noise = model(x, t, **kwargs)
 
         mean = sqrt_recip_alphas_t * (
             x - betas_t * predicted_noise / sqrt_one_minus_alphas_cumprod_t
         )
 
-        posterior_variance_t = betas_t
-
-        # BUG FIX: original had 'if t == 0' where t is a Tensor.
-        # In Python, any non-empty Tensor is truthy, so the else branch was
-        # NEVER executed — no noise was ever added during denoising.
-        # This turned the stochastic sampler into a deterministic one and
-        # prevented the model from exploring the posterior distribution.
+        # BUG FIX (retained): original code had 'if t == 0' where t is a Tensor.
+        # A non-empty Tensor is always truthy, so the else branch (adding noise)
+        # was never executed, making the sampler fully deterministic.
+        # Fixed to t.item() == 0.
         if t.item() == 0:
             return mean
         else:
-            noise    = torch.randn_like(x)
-            variance = torch.sqrt(posterior_variance_t) * noise
-            return mean + variance
+            noise = torch.randn_like(x)
+            return mean + torch.sqrt(betas_t) * noise
 
     @staticmethod
     def get_index_from_list(values, t, x_shape):
-        """Gather schedule values at timestep indices t and reshape for broadcasting."""
+        """Gather schedule values at timestep t and broadcast over (B, C, L)."""
         batch_size = t.shape[0]
         out = values.gather(-1, t.long().cpu())
         return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
@@ -127,7 +127,7 @@ class DiffusionModel:
 # ---------------------------------------------------------------------------
 
 class SinusoidalPositionEmbeddings(nn.Module):
-    """Positional embedding for diffusion timestep t."""
+    """Standard sinusoidal embedding for diffusion timestep t."""
 
     def __init__(self, dim):
         super().__init__()
@@ -136,41 +136,87 @@ class SinusoidalPositionEmbeddings(nn.Module):
     def forward(self, time):
         device   = time.device
         half_dim = self.dim // 2
-        embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = time[:, None] * embeddings[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-        return embeddings
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = time[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
 
 
 # ---------------------------------------------------------------------------
-# U-Net building block
+# Self-attention block
+# ---------------------------------------------------------------------------
+
+class SelfAttention(nn.Module):
+    """
+    Multi-head self-attention over the temporal dimension of a 1-D feature map.
+
+    Paper (Section III-C): "self-attention layers with 4 attention heads are
+    integrated after each downsampling block."
+
+    Input / output shape: (B, C, L).
+    """
+
+    def __init__(self, channels, num_heads=4):
+        super().__init__()
+        self.ln  = nn.LayerNorm(channels)
+        self.mha = nn.MultiheadAttention(channels, num_heads, batch_first=True)
+        self.ff  = nn.Sequential(
+            nn.LayerNorm(channels),
+            nn.Linear(channels, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels),
+        )
+
+    def forward(self, x):
+        # (B, C, L) → (B, L, C) for MHA, then back.
+        x   = x.permute(0, 2, 1)
+        x_n = self.ln(x)
+        attn, _ = self.mha(x_n, x_n, x_n)
+        x = x + attn
+        x = x + self.ff(x)
+        return x.permute(0, 2, 1)
+
+
+# ---------------------------------------------------------------------------
+# U-Net block
 # ---------------------------------------------------------------------------
 
 class Block(nn.Module):
     """
-    Single encoder or decoder block in the U-Net.
+    One encoder or decoder block of the U-Net (paper Section III-C).
 
-    Each block:
-      1. Applies a convolution + BN + ReLU.
-      2. Adds sinusoidal time embedding (projected to channels_out).
-      3. Adds head anthropometric embedding (optional).
-      4. Adds ear anthropometric embedding (optional).
-      5. Adds DOA label embedding (optional).
-      6. Downsamples (stride-2 conv) or upsamples (transposed conv).
+    Processing order:
+      (i)   Conv1d(k=3) + ReLU + BN
+      (ii)  Add conditioning signals to feature maps:
+              • sinusoidal time embedding  (via linear projection)
+              • head anthropometrics       (13 features → channels_out)
+              • ear anthropometrics        (24 features → channels_out)
+              • DOA label                  (nn.Embedding lookup)
+      (iii) Second Conv1d(k=3) with NO activation  [paper spec]
+      (iv)  Stride-2 Conv1d (encoder) or ConvTranspose1d (decoder)
+
+    Anthropometric dims (HUTUBS CSV, all available features):
+      HEAD_DIM = 13  (CIPIC x1-x9, x12, x14, x16, x17)
+      EARS_DIM = 24  (12 left pinna + 12 right pinna: d1-d10, theta1, theta2 each)
 
     Parameters
     ----------
     channels_in, channels_out : int
-    time_embedding_dims : int
-    labels : int or False
-        Number of DOA classes for nn.Embedding, or False to disable.
+    time_embedding_dims       : int
+    labels      : int or False   Number of DOA classes (440 for HUTUBS).
     head_embedding : bool
     ears_embedding : bool
-    downsample : bool
-        True → encoder block (stride-2 conv).
-        False → decoder block (transposed conv, input is concatenated skip).
+    downsample  : bool   True = encoder block; False = decoder block.
     """
+
+    # All 37 available HUTUBS anthropometric features.
+    # See dataset.py and AntrhopometricMeasures.csv for the exact column mapping.
+    # Note: paper cites CIPIC N=27 (17 head + 10 pinna) but HUTUBS provides a
+    # different set; we use everything available rather than dropping valid data.
+    HEAD_DIM = 13   # cols 1-13: x1-x9, x12, x14, x16, x17
+    EARS_DIM = 24   # cols 14-37: L_d1..L_d10, L_theta1, L_theta2,
+                    #             R_d1..R_d10, R_theta1, R_theta2
 
     def __init__(
         self,
@@ -180,74 +226,70 @@ class Block(nn.Module):
         labels,
         head_embedding,
         ears_embedding,
-        num_filters=3,
+        kernel_size=3,
         downsample=True,
     ):
         super().__init__()
 
-        self.time_embedding_dims = time_embedding_dims
-        self.time_embedding      = SinusoidalPositionEmbeddings(time_embedding_dims)
-        self.labels              = labels
-        self.head_embedding      = head_embedding
-        self.ears_embedding      = ears_embedding
+        self.time_embedding  = SinusoidalPositionEmbeddings(time_embedding_dims)
+        self.labels          = labels
+        self.head_embedding  = head_embedding
+        self.ears_embedding  = ears_embedding
+        self.downsample      = downsample
 
-        # DOA conditioning: each spatial position gets a learnable embedding vector.
+        padding = kernel_size // 2
+
         if labels:
             self.label_emb = nn.Embedding(labels, channels_out)
 
-        self.downsample = downsample
-
         if downsample:
-            # Encoder: single-channel input, stride-2 downsampling.
-            self.conv1 = nn.Conv1d(channels_in,      channels_out, num_filters, padding=1)
-            self.final = nn.Conv1d(channels_out,     channels_out, 4, 2, 1)
+            self.conv1 = nn.Conv1d(channels_in,     channels_out, kernel_size, padding=padding)
+            self.final = nn.Conv1d(channels_out,    channels_out, 4, 2, 1)
         else:
-            # Decoder: skip connection doubles the channel count.
-            self.conv1 = nn.Conv1d(2 * channels_in,  channels_out, num_filters, padding=1)
+            # Skip connection doubles the input channel count in the decoder.
+            self.conv1 = nn.Conv1d(2 * channels_in, channels_out, kernel_size, padding=padding)
             self.final = nn.ConvTranspose1d(channels_out, channels_out, 4, 2, 1)
 
-        self.bnorm1 = nn.BatchNorm1d(channels_out)
-
+        self.bnorm1   = nn.BatchNorm1d(channels_out)
         self.time_mlp = nn.Linear(time_embedding_dims, channels_out)
-
-        if ears_embedding:
-            # 24 ear anthropometric features → time_embedding_dims → channels_out.
-            self.ears_measurement_embedding = nn.Linear(24, time_embedding_dims)
-            self.ears_mlp = nn.Linear(time_embedding_dims, channels_out)
+        self.relu     = nn.ReLU()
 
         if head_embedding:
-            # 13 head anthropometric features → time_embedding_dims → channels_out.
-            self.head_measurement_embedding = nn.Linear(13, time_embedding_dims)
-            self.head_mlp = nn.Linear(time_embedding_dims, channels_out)
+            self.head_mlp = nn.Linear(self.HEAD_DIM, channels_out)
 
-        self.relu = nn.ReLU()
+        if ears_embedding:
+            self.ears_mlp = nn.Linear(self.EARS_DIM, channels_out)
+
+        # Second conv with no activation (paper Section III-C).
+        self.conv2 = nn.Conv1d(channels_out, channels_out, kernel_size, padding=padding)
 
     def forward(self, x, t, **kwargs):
-        # --- Convolution + BN + ReLU ---
+        # (i) First conv + BN + ReLU.
         o = self.bnorm1(self.relu(self.conv1(x)))
 
-        # --- Time embedding ---
-        o_time = self.relu(self.time_mlp(self.time_embedding(t)))
-        o = o + o_time.unsqueeze(2)
+        # (ii) Conditioning injections — each projected to (B, channels_out)
+        #      then broadcast over the temporal dimension as (B, channels_out, 1).
+        o = o + self.relu(self.time_mlp(self.time_embedding(t))).unsqueeze(2)
 
-        # --- Head anthropometrics ---
         if self.head_embedding:
             head_meas = kwargs.get('head_embedding')
-            o_head = self.head_mlp(self.head_measurement_embedding(head_meas.float()))
-            o = o + o_head.unsqueeze(2)
+            if head_meas is not None:
+                o = o + self.head_mlp(head_meas.float()).unsqueeze(2)
 
-        # --- Ear anthropometrics ---
         if self.ears_embedding:
             ear_meas = kwargs.get('ears_embedding')
-            o_ears = self.ears_mlp(self.ears_measurement_embedding(ear_meas.float()))
-            o = o + o_ears.unsqueeze(2)
+            if ear_meas is not None:
+                o = o + self.ears_mlp(ear_meas.float()).unsqueeze(2)
 
-        # --- DOA label embedding ---
         if self.labels:
-            label   = kwargs.get('labels')
-            o_label = self.label_emb(label).squeeze(1)
-            o = o + o_label.unsqueeze(2)
+            label = kwargs.get('labels')
+            if label is not None:
+                o = o + self.label_emb(label).squeeze(1).unsqueeze(2)
 
+        # (iii) Second conv, no activation.
+        o = self.conv2(o)
+
+        # (iv) Downsample / upsample.
         return self.final(o)
 
 
@@ -257,57 +299,63 @@ class Block(nn.Module):
 
 class UNet(nn.Module):
     """
-    1-D U-Net for noise prediction.
+    1-D U-Net noise predictor for HRTF personalisation.
 
-    Input : (B, audio_channels, L)   — noisy HRIR at timestep t.
-    Output: (B, audio_channels, L)   — predicted noise ε.
+    Input : (B, 2, L)   noisy binaural HRIR at diffusion step t.
+    Output: (B, 2, L)   predicted noise ε_θ(x_t, t, r, a).
 
-    audio_channels=2 means both ears are predicted jointly in a single forward
-    pass, matching the paper's architecture description.
+    Encoder: 4 downsampling blocks (sequence_channels pairs),
+             each followed by SelfAttention (4 heads).
+    Decoder: 4 upsampling blocks with skip connections from the encoder.
+    Stem   : Conv1d(audio_channels → sequence_channels[0]).
+    Head   : Conv1d(sequence_channels[0] → audio_channels).
 
     Parameters
     ----------
-    audio_channels : int
-        1 = single-ear, 2 = binaural (paper default).
-    time_embedding_dims : int
-        Dimension of sinusoidal time embedding.
-    labels : int or False
-        Number of DOA embedding classes (440 for full HUTUBS sphere).
-    head_embedding, ears_embedding : bool
-        Whether to inject anthropometric conditioning.
-    sequence_channels : tuple[int]
-        Channel widths at each encoder scale.
+    audio_channels      : int     2 = binaural (paper default).
+    time_embedding_dims : int     Sinusoidal embedding dimension (paper unspecified).
+    labels              : int or False   DOA classes (440 for full HUTUBS sphere).
+    head_embedding      : bool    Inject head/torso anthropometrics.
+    ears_embedding      : bool    Inject pinna anthropometrics.
+    sequence_channels   : tuple   Encoder channel widths. Paper: (4, 8, 16, 32, 64).
     """
 
     def __init__(
         self,
         audio_channels=2,
-        time_embedding_dims=256,
+        time_embedding_dims=128,
         labels=False,
         head_embedding=False,
         ears_embedding=False,
-        sequence_channels=(64, 128, 256, 512, 1024),
+        sequence_channels=(4, 8, 16, 32, 64),
     ):
         super().__init__()
-        self.time_embedding_dims = time_embedding_dims
 
-        # Encoder: 4 downsampling blocks (len(sequence_channels) - 1).
+        # Stem.
+        self.conv1 = nn.Conv1d(audio_channels, sequence_channels[0], 3, padding=1)
+
+        # Encoder: one Block per adjacent channel pair.
         self.downsampling = nn.ModuleList([
-            Block(ch_in, ch_out, time_embedding_dims, labels, head_embedding, ears_embedding)
+            Block(ch_in, ch_out, time_embedding_dims,
+                  labels, head_embedding, ears_embedding, downsample=True)
             for ch_in, ch_out in zip(sequence_channels, sequence_channels[1:])
         ])
 
-        # Decoder: 4 upsampling blocks, mirroring the encoder.
+        # Self-attention after each encoder block (paper: "after each downsampling block").
+        self.encoder_attentions = nn.ModuleList([
+            SelfAttention(ch_out, num_heads=4)
+            for ch_out in sequence_channels[1:]
+        ])
+
+        # Decoder: mirrors encoder.
         sc_rev = sequence_channels[::-1]
         self.upsampling = nn.ModuleList([
-            Block(ch_in, ch_out, time_embedding_dims, labels, head_embedding, ears_embedding,
-                  downsample=False)
+            Block(ch_in, ch_out, time_embedding_dims,
+                  labels, head_embedding, ears_embedding, downsample=False)
             for ch_in, ch_out in zip(sc_rev, sc_rev[1:])
         ])
 
-        # Stem: project audio channels to first encoder width.
-        self.conv1 = nn.Conv1d(audio_channels, sequence_channels[0],  3, padding=1)
-        # Head: project back to audio channels.
+        # Head.
         self.conv2 = nn.Conv1d(sequence_channels[0], audio_channels, 1)
 
     def forward(self, x, t, **kwargs):
@@ -315,13 +363,16 @@ class UNet(nn.Module):
 
         o = self.conv1(x)
 
-        # Encoder path — store residuals for skip connections.
-        for ds in self.downsampling:
+        # Encoder: downsample → attention → store skip.
+        for ds, attn in zip(self.downsampling, self.encoder_attentions):
             o = ds(o, t, **kwargs)
+            o = attn(o)
             residuals.append(o)
 
-        # Decoder path — concatenate skip connections before each block.
+        # Decoder: pad if needed → cat skip → upsample.
         for us, res in zip(self.upsampling, reversed(residuals)):
+            if o.shape[2] != res.shape[2]:
+                o = F.pad(o, (0, res.shape[2] - o.shape[2]))
             o = us(torch.cat((o, res), dim=1), t, **kwargs)
 
         return self.conv2(o)
