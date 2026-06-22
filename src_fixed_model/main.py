@@ -85,13 +85,16 @@ parser.add_argument('--p_uncond',            type=float, default=0.0,
                     help='CFG dropout probability. Paper does not use CFG (default=0.0).')
 parser.add_argument('--timesteps',           type=int,   default=600,
                     help='Diffusion steps (paper: 600)')
+parser.add_argument('--start_fold',          type=int,   default=0,
+                    help='Resume training from this fold index (default: 0). '
+                         'Folds below this value are skipped entirely.')
 parser.add_argument('--verbose',             action='store_true')
 args = parser.parse_args()
 
 os.makedirs(args.results_dir, exist_ok=True)
 
 if args.verbose:
-    print(f'folds={args.folds}, timesteps={args.timesteps}, lr={args.lr}, '
+    print(f'folds={args.folds}, start_fold={args.start_fold}, timesteps={args.timesteps}, lr={args.lr}, '
           f'batch_size={args.batch_size}, early_stop={args.early_stop_patience}, '
           f'p_uncond={args.p_uncond}')
 
@@ -146,6 +149,11 @@ if args.training:
     all_fold_lsd_v2 = []
 
     for fold_k in range(K):
+
+        if fold_k < args.start_fold:
+            print(f'Skipping fold {fold_k} (--start_fold={args.start_fold})')
+            continue
+
         print(f"\n{'='*60}")
         print(f'FOLD {fold_k + 1} / {K}')
         print(f"{'='*60}")
