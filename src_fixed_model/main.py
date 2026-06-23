@@ -1,610 +1,585 @@
-"""
-main.py — Training and inference for HRTF personalisation DDPM.
-
-Training (k-fold cross-validation):
-    python main.py --training --folds 5 --epochs 1000 --batch_size 64 \
-                   --results_dir results/
-
-Inference (after training all folds):
-    python main.py --results_dir results/
-
-K-fold protocol
----------------
-93 valid subjects are partitioned into K folds of roughly equal size.
-For each fold k:
-  - Test  = subjects in fold k
-  - Val   = subjects in fold (k+1) % K
-  - Train = all remaining subjects (K-2 folds), with ear-mirroring augmentation
-
-Optimizer (paper Section IV-A)
--------------------------------
-Adam, lr=0.001, StepLR decay of 20% every 100 epochs.
-1000 epochs, early stopping with patience=200.
-
-LR default is 1e-3 (paper value). Previous version used 5e-5 (too low).
-
-Anthropometric features
------------------------
-All 37 available HUTUBS features are used:
-  13 head/torso (x1-x9, x12, x14, x16, x17) + 24 ear (12L + 12R pinna).
-The paper references CIPIC N=27 but HUTUBS provides a different set;
-see dataset.py for the full explanation.
-
-Architecture (model.py)
-------------------------
-Matches arxiv 2501.02871 Section III-C:
-  sequence_channels=(4,8,16,32,64), self-attention after each encoder block,
-  second conv with no activation in each Block, binaural output (audio_channels=2).
-"""
-
-import os
-import random
-import argparse
-from collections import defaultdict
-
-import numpy as np
 import torch
+import argparse
 import tqdm
-import scipy.io
+import numpy as np
+import pandas as pd
+import scipy.io as sio
+import matplotlib
+matplotlib.use('Agg')   # non-interactive backend — safe for remote servers
+import matplotlib.pyplot as plt
+import torchaudio
+import os
+import json
+from torch.utils.data import DataLoader, Subset
+from torch.utils.tensorboard import SummaryWriter
 
-from dataset import HUTUBSDataset, collate_fn, EXCLUDED_SUBJECT_IDS, N_SOFA_FILES
+from dataset import HUTUBSDataset, collate_fn
 from model import DiffusionModel, UNet
-from utils import plot_noise_distribution, lsd_paper, lsd_corrected
+from utils import plot_noise_distribution, nmse, lsd
 
-
-# ---------------------------------------------------------------------------
-# Reproducibility
-# ---------------------------------------------------------------------------
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-
+# ── Device ────────────────────────────────────────────────────────────────────
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f'Using device: {device}')
+print(f"Using device: {device}")
 
-
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
-parser = argparse.ArgumentParser(description='HRTF DDPM — k-fold training / inference')
-parser.add_argument('--training',            action='store_true')
-parser.add_argument('--folds',               type=int,   default=5,
-                    help='Number of cross-validation folds (default: 5)')
-parser.add_argument('--epochs',              type=int,   default=1000)
-parser.add_argument('--batch_size',          type=int,   default=64)
-parser.add_argument('--lr',                  type=float, default=1e-3,
-                    help='Initial learning rate (paper: 0.001)')
-parser.add_argument('--early_stop_patience', type=int,   default=200)
-parser.add_argument('--results_dir',         type=str,   default='results')
-parser.add_argument('--hrtf_directory',      type=str,
-                    default='/content/drive/MyDrive/hrtf-ddpm/HUTUBS/HRIRs')
-parser.add_argument('--anthro_csv_path',     type=str,
-                    default='/content/drive/MyDrive/hrtf-ddpm/HUTUBS/AntrhopometricMeasures.csv')
-parser.add_argument('--p_uncond',            type=float, default=0.0,
-                    help='CFG dropout probability. Paper does not use CFG (default=0.0).')
-parser.add_argument('--timesteps',           type=int,   default=600,
-                    help='Diffusion steps (paper: 600)')
-parser.add_argument('--start_fold',          type=int,   default=0,
-                    help='Resume training from this fold index (default: 0). '
-                         'Folds below this value are skipped entirely.')
-parser.add_argument('--inference_batch_size', type=int, default=440,
-                    help='Number of HRTF positions denoised in parallel during inference. '
-                         'Use 440 to process one full HUTUBS subject at once; lower this if you run out of GPU memory.')
-parser.add_argument('--verbose',             action='store_true')
+# ── Arguments ─────────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser(description='HRTF DDPM — per-fold training & inference')
+parser.add_argument('--mode', type=str, choices=['train', 'infer'], required=True,
+                    help='"train" or "infer"')
+parser.add_argument('--fold', type=int, default=None,
+                    help='Which fold to run (1-based). Omit to run all folds.')
+parser.add_argument('--BATCH_SIZE', type=int, default=128)
+parser.add_argument('--epochs', type=int, default=1000)
+# ── LR & Scheduler ────────────────────────────────────────────────────────────
+# StepLR (paper: lr=1e-3, 20% decay every 100 epochs) is preferred over
+# CosineAnnealing because:
+#   1. StepLR is monotonically decreasing — early stopping always saves the
+#      checkpoint at the model's most fine-grained convergence point.
+#      CosineAnnealing oscillates; with early stopping the saved checkpoint
+#      can land at any arbitrary point in the cosine cycle.
+#   2. Cosine restarts help escape local minima over long budgets; with
+#      ~1000 epochs and early stopping at ~400-600, they add noise not value.
+# A 10-epoch linear warmup is prepended to stabilise attention layers at init.
+parser.add_argument('--lr', type=float, default=1e-3)
+parser.add_argument('--lr_warmup_epochs', type=int, default=10)
+parser.add_argument('--lr_step', type=int, default=100)
+parser.add_argument('--lr_gamma', type=float, default=0.8)
+parser.add_argument('--early_stop_patience', type=int, default=200)
+parser.add_argument('--early_stop_min_epoch', type=int, default=100)
+# ── Paths ─────────────────────────────────────────────────────────────────────
+parser.add_argument('--base_dir', type=str, default='.',
+                    help='Root directory; all output folders are created under here')
+parser.add_argument('--k_folds', type=int, default=5)
+parser.add_argument('--hrtf_directory', type=str,
+                    default='/nas/home/jalbarracin/datasets/HUTUBS/HRIRs')
+parser.add_argument('--anthro_csv_path', type=str,
+                    default='/nas/home/jalbarracin/datasets/HUTUBS/AntrhopometricMeasures.csv')
+parser.add_argument('--verbose', action='store_true')
 args = parser.parse_args()
 
-os.makedirs(args.results_dir, exist_ok=True)
+# ── Directory layout ──────────────────────────────────────────────────────────
+#
+#   <base_dir>/
+#     runs/          ← TensorBoard event files, one sub-dir per fold
+#       fold_1/
+#       fold_2/  ...
+#     checkpoints/   ← best model weights per fold  (unet_fold1.pt ...)
+#     results/
+#       mat/         ← .mat files per subject (NMSE, LSD, generated HRIRs)
+#       plots/       ← noise-distribution PNGs and per-subject HRIR plots
+#       fold_*/      ← generated .wav files per subject/position
+#
+RUNS_DIR   = os.path.join(args.base_dir, 'runs')
+CKPT_DIR   = os.path.join(args.base_dir, 'checkpoints')
+RES_DIR    = os.path.join(args.base_dir, 'results')
+MAT_DIR    = os.path.join(RES_DIR, 'mat')
+PLOTS_DIR  = os.path.join(RES_DIR, 'plots')
 
-if args.verbose:
-    print(f'folds={args.folds}, start_fold={args.start_fold}, timesteps={args.timesteps}, lr={args.lr}, '
-          f'batch_size={args.batch_size}, inference_batch_size={args.inference_batch_size}, '
-          f'early_stop={args.early_stop_patience}, p_uncond={args.p_uncond}')
+for d in [RUNS_DIR, CKPT_DIR, RES_DIR, MAT_DIR, PLOTS_DIR]:
+    os.makedirs(d, exist_ok=True)
 
+# splits.json lives in checkpoints/ so it travels with the model weights
+SPLITS_PATH = os.path.join(CKPT_DIR, 'splits.json')
 
-# ---------------------------------------------------------------------------
-# Subject list and fold assignment
-# ---------------------------------------------------------------------------
-all_subject_ids = sorted(
-    sid for sid in range(1, N_SOFA_FILES + 1)
-    if sid not in EXCLUDED_SUBJECT_IDS
+# ── Dataset ───────────────────────────────────────────────────────────────────
+print("Loading dataset...")
+hutubs_dataset = HUTUBSDataset(
+    hrtf_directory=args.hrtf_directory,
+    anthro_csv_path=args.anthro_csv_path,
 )
-n_subjects = len(all_subject_ids)   # 93
+print(f"Dataset size: {len(hutubs_dataset)} samples")
 
-K = args.folds
+if os.path.exists(SPLITS_PATH):
+    with open(SPLITS_PATH) as f:
+        splits = json.load(f)
+    print(f"Loaded existing splits from {SPLITS_PATH}")
+else:
+    splits = hutubs_dataset.get_kfold_splits(k=args.k_folds)
+    splits_serialisable = [
+        {k: [int(x) for x in v] for k, v in s.items()}
+        for s in splits
+    ]
+    with open(SPLITS_PATH, 'w') as f:
+        json.dump(splits_serialisable, f, indent=2)
+    print(f"Saved splits to {SPLITS_PATH}")
 
-fold_assignments = [[] for _ in range(K)]
-for i, sid in enumerate(all_subject_ids):
-    fold_assignments[i % K].append(sid)
+# Resolve folds to run
+if args.fold is not None:
+    assert 1 <= args.fold <= len(splits), \
+        f"--fold must be 1–{len(splits)}, got {args.fold}"
+    fold_indices = [args.fold - 1]
+else:
+    fold_indices = list(range(len(splits)))
 
-if args.verbose:
-    for k, subjects in enumerate(fold_assignments):
-        print(f'  Fold {k}: {len(subjects)} subjects — {subjects[:3]}…')
-
-
-# ---------------------------------------------------------------------------
-# Diffusion schedule (shared across folds — schedule only, no weights)
-# ---------------------------------------------------------------------------
-diffusion_model = DiffusionModel(timesteps=args.timesteps)
+# ── Diffusion model ───────────────────────────────────────────────────────────
+diffusion_model = DiffusionModel()   # 600 timesteps
+NUM_CLASSES = 440
 
 
-# ---------------------------------------------------------------------------
-# Helper: build UNet with consistent hyperparameters
-# ---------------------------------------------------------------------------
-def make_unet():
-    """Instantiate the U-Net matching the paper architecture."""
+def build_unet():
     return UNet(
-        audio_channels    = 2,                      # binaural
-        time_embedding_dims = 128,                  # paper unspecified; kept small
-        labels            = 440,                    # HUTUBS DOA positions
-        head_embedding    = True,
-        ears_embedding    = True,
-        sequence_channels = (4, 8, 16, 32, 64),    # paper Section III-C
+        audio_channels=2,
+        labels=NUM_CLASSES,
+        head_embedding=True,
+        ears_embedding=True,
+        sequence_channels=(32, 64, 128, 256, 512),
+    ).to(device)
+
+
+def ckpt_path(fold_idx):
+    return os.path.join(CKPT_DIR, f'unet_fold{fold_idx + 1}.pt')
+
+
+def build_subject_point_index(dataset):
+    idx_map = {}
+    for i, item in enumerate(dataset.normalized_dataset):
+        idx_map[(item['subject_id'], item['measurement_point'])] = i
+    return idx_map
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TRAINING
+# ═════════════════════════════════════════════════════════════════════════════
+def train_fold(fold_idx, split):
+    fold_tag = f'fold_{fold_idx + 1}'
+    print(f"\n{'='*60}")
+    print(f"  TRAINING  FOLD {fold_idx + 1}/{args.k_folds}  |  "
+          f"test subjects: {split['test_subjects']}")
+    print(f"{'='*60}")
+
+    # ── TensorBoard writer for this fold ─────────────────────────────────────
+    writer = SummaryWriter(log_dir=os.path.join(RUNS_DIR, fold_tag))
+
+    # Log hyperparameters once per fold so they appear in the HParams tab
+    writer.add_hparams(
+        hparam_dict={
+            'lr': args.lr,
+            'lr_warmup_epochs': args.lr_warmup_epochs,
+            'lr_step': args.lr_step,
+            'lr_gamma': args.lr_gamma,
+            'batch_size': args.BATCH_SIZE,
+            'early_stop_patience': args.early_stop_patience,
+            'fold': fold_idx + 1,
+        },
+        metric_dict={'best_val_loss': float('inf')},   # updated at end
     )
 
-
-def _stack_subject_chunk(items, start, end, device):
-    """Create one inference batch from a subject's measurement-position items.
-
-    The old code denoised one measurement position at a time. This helper keeps
-    the same conditioning information but stacks positions into a batch so the
-    600 reverse-diffusion steps run in parallel on the GPU.
-    """
-    chunk = items[start:end]
-
-    hrir_gt = torch.stack([item['hrtf'] for item in chunk], dim=0)
-    head = torch.stack([item['head_measurements'] for item in chunk], dim=0).float().to(device)
-    ears = torch.stack([item['ear_measurements'] for item in chunk], dim=0).float().to(device)
-    labels = torch.tensor(
-        [item['measurement_point'] for item in chunk],
-        dtype=torch.long,
-        device=device,
+    train_loader = DataLoader(
+        Subset(hutubs_dataset, split['train']),
+        batch_size=args.BATCH_SIZE, shuffle=True,
+        num_workers=4, drop_last=True, collate_fn=collate_fn,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        Subset(hutubs_dataset, split['val']),
+        batch_size=args.BATCH_SIZE, shuffle=False,
+        num_workers=4, drop_last=False, collate_fn=collate_fn,
+        pin_memory=True,
     )
 
-    return hrir_gt, head, ears, labels
+    unet = build_unet()
+    optimizer = torch.optim.Adam(unet.parameters(), lr=args.lr)
 
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, end_factor=1.0,
+        total_iters=args.lr_warmup_epochs,
+    )
+    step_scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=args.lr_step, gamma=args.lr_gamma,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, step_scheduler],
+        milestones=[args.lr_warmup_epochs],
+    )
 
-def infer_subject_batched(items, unet, diffusion_model, norm_mean, norm_std, device, inference_batch_size):
-    """Generate predictions for all measurement positions of one subject.
+    best_val_loss    = float('inf')
+    early_stop_count = 0
+    model_path       = ckpt_path(fold_idx)
+    plots_fold_dir   = os.path.join(PLOTS_DIR, fold_tag)
+    os.makedirs(plots_fold_dir, exist_ok=True)
 
-    This is mathematically the same reverse DDPM loop as the original inference
-    code, but it processes many positions simultaneously. The output order is
-    preserved, so LSD and the saved .mat files are computed in the same order as
-    before.
-    """
-    if inference_batch_size <= 0:
-        raise ValueError('--inference_batch_size must be a positive integer')
+    for epoch in tqdm.tqdm(range(args.epochs), desc=fold_tag, unit='epoch'):
 
-    hrir_gt_list = []
-    hrir_pred_list = []
+        # ── Train ─────────────────────────────────────────────────────────────
+        unet.train()
+        train_losses = []
+        for data in train_loader:
+            batch = data['hrtf'].to(device, non_blocking=True).float()
+            label = data['measurement_point'].to(device, non_blocking=True)
+            head  = data['head_measurements'].to(device, non_blocking=True)
+            ears  = data['ear_measurements'].to(device, non_blocking=True)
 
-    with torch.inference_mode():
-        for start in range(0, len(items), inference_batch_size):
-            end = min(start + inference_batch_size, len(items))
-            hrir_gt, head, ears, labels = _stack_subject_chunk(items, start, end, device)
+            t = torch.randint(0, diffusion_model.timesteps,
+                              (batch.shape[0],), device=device).long()
+            batch_noisy, noise = diffusion_model.forward(batch, t, device)
 
-            batch_size = end - start
-            L = hrir_gt.shape[-1]
-            audio_result = torch.randn((batch_size, 2, L), device=device)
+            predicted_noise = unet(
+                batch_noisy.float(), t,
+                labels=label, head_embedding=head, ears_embedding=ears,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            loss = torch.nn.functional.l1_loss(noise, predicted_noise)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
+            optimizer.step()
+            train_losses.append(loss.item())
 
-            for i in reversed(range(diffusion_model.timesteps)):
-                t = torch.full((batch_size,), i, dtype=torch.long, device=device)
-                audio_result = diffusion_model.backward(
-                    x              = audio_result,
-                    t              = t,
-                    model          = unet,
-                    labels         = labels,
-                    head_embedding = head,
-                    ears_embedding = ears,
+        scheduler.step()
+
+        # ── Validate ──────────────────────────────────────────────────────────
+        unet.eval()
+        val_losses = []
+        last_noise = last_pred = None
+        with torch.no_grad():
+            for data in val_loader:
+                batch = data['hrtf'].to(device, non_blocking=True).float()
+                label = data['measurement_point'].to(device, non_blocking=True)
+                head  = data['head_measurements'].to(device, non_blocking=True)
+                ears  = data['ear_measurements'].to(device, non_blocking=True)
+
+                t = torch.randint(0, diffusion_model.timesteps,
+                                  (batch.shape[0],), device=device).long()
+                batch_noisy, noise = diffusion_model.forward(batch, t, device)
+                pred = unet(
+                    batch_noisy.float(), t,
+                    labels=label, head_embedding=head, ears_embedding=ears,
                 )
+                val_losses.append(
+                    torch.nn.functional.l1_loss(noise, pred).item()
+                )
+                last_noise, last_pred = noise, pred   # keep last batch for plots
 
-            pred_denorm = (audio_result.detach().cpu() * norm_std) + norm_mean
-            gt_denorm = (hrir_gt.cpu() * norm_std) + norm_mean
+        mean_train = np.mean(train_losses)
+        mean_val   = np.mean(val_losses)
+        current_lr = scheduler.get_last_lr()[0]
 
-            hrir_pred_list.extend(pred_denorm.numpy())
-            hrir_gt_list.extend(gt_denorm.numpy())
+        # ── TensorBoard scalars ───────────────────────────────────────────────
+        writer.add_scalar('Loss/train',      mean_train, epoch)
+        writer.add_scalar('Loss/val',        mean_val,   epoch)
+        writer.add_scalar('LR/learning_rate', current_lr, epoch)
+        writer.add_scalar('EarlyStopping/patience_counter', early_stop_count, epoch)
 
-    return hrir_gt_list, hrir_pred_list
+        # Gradient norm (useful for diagnosing training stability)
+        total_grad_norm = sum(
+            p.grad.data.norm(2).item() ** 2
+            for p in unet.parameters() if p.grad is not None
+        ) ** 0.5
+        writer.add_scalar('Gradients/total_norm', total_grad_norm, epoch)
+
+        # ── Noise-distribution plot → TensorBoard + disk (every 50 epochs) ───
+        if epoch % 50 == 0 and last_noise is not None:
+            plot_path = os.path.join(plots_fold_dir, f'noise_ep{epoch:04d}.png')
+            plot_noise_distribution(last_noise, last_pred, epoch, plot_path=plot_path)
+            # Load saved PNG and push to TensorBoard as an image
+            import torchvision.transforms.functional as tvf
+            from PIL import Image
+            img = Image.open(plot_path)
+            img_tensor = tvf.to_tensor(img)          # (C, H, W) in [0,1]
+            writer.add_image(f'NoiseDist/epoch_{epoch:04d}', img_tensor, epoch)
+
+        if args.verbose or epoch % 50 == 0:
+            print(f"  Epoch {epoch:4d} | Train {mean_train:.4f} | Val {mean_val:.4f} | "
+                  f"LR {current_lr:.2e} | Patience {early_stop_count}/{args.early_stop_patience}")
+
+        # ── Checkpoint ────────────────────────────────────────────────────────
+        if mean_val < best_val_loss:
+            best_val_loss = mean_val
+            torch.save({
+                'epoch':      epoch,
+                'model_state_dict': unet.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'val_loss':   best_val_loss,
+                'fold':       fold_idx + 1,
+            }, model_path)
+            early_stop_count = 0
+            if args.verbose:
+                print(f"  ✓ Checkpoint saved — val {best_val_loss:.4f}")
+        elif epoch >= args.early_stop_min_epoch:
+            early_stop_count += 1
+
+        writer.flush()
+
+        if early_stop_count > args.early_stop_patience:
+            print(f"  Early stopping at epoch {epoch}")
+            break
+
+    # Update hparams with final metric so the HParams tab shows real values
+    writer.add_hparams(
+        hparam_dict={
+            'lr': args.lr, 'lr_warmup_epochs': args.lr_warmup_epochs,
+            'lr_step': args.lr_step, 'lr_gamma': args.lr_gamma,
+            'batch_size': args.BATCH_SIZE,
+            'early_stop_patience': args.early_stop_patience,
+            'fold': fold_idx + 1,
+        },
+        metric_dict={'best_val_loss': best_val_loss},
+    )
+    writer.close()
+    print(f"  Fold {fold_idx + 1} done — best val loss: {best_val_loss:.4f}")
+    return best_val_loss
 
 
-# ---------------------------------------------------------------------------
-# Training — iterate over all K folds
-# ---------------------------------------------------------------------------
-if args.training:
+# ═════════════════════════════════════════════════════════════════════════════
+# INFERENCE
+# ═════════════════════════════════════════════════════════════════════════════
+def infer_fold(fold_idx, split, subj_point_index):
+    model_path = ckpt_path(fold_idx)
+    if not os.path.exists(model_path):
+        print(f"No checkpoint at {model_path} — skipping fold {fold_idx + 1}")
+        return [], []
 
-    all_fold_lsd_v1 = []
-    all_fold_lsd_v2 = []
+    fold_tag = f'fold_{fold_idx + 1}'
+    print(f"\n{'='*60}")
+    print(f"  INFERENCE  FOLD {fold_idx + 1}/{args.k_folds}  |  "
+          f"test subjects: {split['test_subjects']}")
+    print(f"{'='*60}")
 
-    for fold_k in range(K):
+    # ── TensorBoard writer for inference metrics ──────────────────────────────
+    writer = SummaryWriter(log_dir=os.path.join(RUNS_DIR, fold_tag))
 
-        if fold_k < args.start_fold:
-            print(f'Skipping fold {fold_k} (--start_fold={args.start_fold})')
+    unet = build_unet()
+    ckpt = torch.load(model_path, map_location=device)
+    unet.load_state_dict(ckpt['model_state_dict'])
+    unet.eval()
+    if hasattr(torch, 'compile'):
+        unet = torch.compile(unet)
+
+    # Pre-compute schedule tensors on GPU once
+    betas_gpu              = diffusion_model.betas.to(device)
+    alphas_gpu             = diffusion_model.alphas.to(device)
+    sqrt_recip_alphas_gpu  = torch.sqrt(1.0 / alphas_gpu)
+    sqrt_one_minus_acp_gpu = torch.sqrt(1.0 - diffusion_model.alphas_cumprod.to(device))
+
+    # Output dirs
+    wav_dir   = os.path.join(RES_DIR, fold_tag)
+    mat_fold  = os.path.join(MAT_DIR,  fold_tag)
+    plot_fold = os.path.join(PLOTS_DIR, fold_tag)
+    for d in [wav_dir, mat_fold, plot_fold]:
+        os.makedirs(d, exist_ok=True)
+
+    # Resume support
+    progress_path = os.path.join(wav_dir, 'progress.json')
+    if os.path.exists(progress_path):
+        with open(progress_path) as f:
+            progress = json.load(f)
+        print(f"  Resuming — {len(progress['done_subjects'])} subjects already done.")
+    else:
+        progress = {'done_subjects': [], 'lsd': [], 'nmse': []}
+
+    done_set  = set(progress['done_subjects'])
+    fold_lsd  = progress['lsd']
+    fold_nmse = progress['nmse']
+    INFER_BATCH = 64
+
+    for subject_id in tqdm.tqdm(split['test_subjects'], desc=f'{fold_tag} infer'):
+        if subject_id in done_set:
             continue
 
-        print(f"\n{'='*60}")
-        print(f'FOLD {fold_k + 1} / {K}')
-        print(f"{'='*60}")
+        hrir_sub  = []
+        hrir_tsub = []
+        nmse_sub  = []
+        sub_wav_dir = os.path.join(wav_dir, f'sub_{subject_id}')
+        os.makedirs(sub_wav_dir, exist_ok=True)
 
-        fold_dir = os.path.join(args.results_dir, f'fold_{fold_k}')
-        os.makedirs(fold_dir, exist_ok=True)
+        data_ref = hutubs_dataset[subj_point_index[(subject_id, 0)]]
+        head_1 = data_ref['head_measurements'].to(device).float()
+        ears_1 = data_ref['ear_measurements'].to(device).float()
+        g_std  = data_ref['global_std']
+        g_mean = data_ref['global_mean']
 
-        # Test: fold k.  Val: fold (k+1)%K.  Train: everything else.
-        test_subject_ids  = fold_assignments[fold_k]
-        val_subject_ids   = fold_assignments[(fold_k + 1) % K]
-        train_subject_ids = [
-            sid for i, fold in enumerate(fold_assignments)
-            for sid in fold
-            if i != fold_k and i != (fold_k + 1) % K
-        ]
+        gt_hrirs     = []
+        valid_points = []
+        for c in range(440):
+            key = (subject_id, c)
+            if key not in subj_point_index:
+                continue
+            gt_hrirs.append(hutubs_dataset[subj_point_index[key]]['hrtf'])
+            valid_points.append(c)
 
-        if args.verbose:
-            print(f'  Train: {len(train_subject_ids)} subjects')
-            print(f'  Val:   {len(val_subject_ids)} subjects — {val_subject_ids}')
-            print(f'  Test:  {len(test_subject_ids)} subjects — {test_subject_ids}')
+        n_points = len(valid_points)
+        if n_points == 0:
+            continue
 
-        # Training set: augment=True enables ear-mirroring (doubles set size).
-        # Val / test: augment=False — always evaluated on real unmodified HRIRs.
-        train_dataset = HUTUBSDataset(
-            hrtf_directory  = args.hrtf_directory,
-            anthro_csv_path = args.anthro_csv_path,
-            subject_ids     = train_subject_ids,
-            augment         = True,
-        )
+        # ── Batched denoising (all positions in parallel) ─────────────────────
+        all_results = []
+        torch.manual_seed(42)
 
-        norm_kwargs = dict(
-            norm_mean        = train_dataset.norm_mean,
-            norm_std         = train_dataset.norm_std,
-            norm_anthro_mean = train_dataset.norm_anthro_mean,
-            norm_anthro_std  = train_dataset.norm_anthro_std,
-        )
+        for start in range(0, n_points, INFER_BATCH):
+            end = min(start + INFER_BATCH, n_points)
+            b   = end - start
+            pts = valid_points[start:end]
 
-        val_dataset = HUTUBSDataset(
-            hrtf_directory  = args.hrtf_directory,
-            anthro_csv_path = args.anthro_csv_path,
-            subject_ids     = val_subject_ids,
-            augment         = False,
-            **norm_kwargs,
-        )
-
-        test_dataset = HUTUBSDataset(
-            hrtf_directory  = args.hrtf_directory,
-            anthro_csv_path = args.anthro_csv_path,
-            subject_ids     = test_subject_ids,
-            augment         = False,
-            **norm_kwargs,
-        )
-
-        if args.verbose:
-            real_train = len(train_subject_ids) * 440
-            print(f'  Train items: {len(train_dataset)} '
-                  f'({real_train} real + {len(train_dataset) - real_train} mirrored)')
-            print(f'  Val items:   {len(val_dataset)}')
-            print(f'  Test items:  {len(test_dataset)}')
-
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=args.batch_size,
-            shuffle=True, num_workers=4, pin_memory=True,
-            drop_last=True, collate_fn=collate_fn,
-        )
-        val_loader = torch.utils.data.DataLoader(
-            val_dataset, batch_size=args.batch_size,
-            shuffle=False, num_workers=4, pin_memory=True,
-            drop_last=False, collate_fn=collate_fn,
-        )
-
-        # Fresh model for each fold.
-        unet = make_unet().to(device)
-
-        # Paper optimizer: Adam lr=0.001, 20% decay every 100 epochs.
-        optimizer = torch.optim.Adam(unet.parameters(), lr=args.lr)
-        
-        # scheduler = torch.optim.lr_scheduler.StepLR(
-        #     optimizer, step_size=100, gamma=0.9
-        # )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=args.epochs,
-            eta_min=1e-5,
-        )
-
-        model_path      = os.path.join(fold_dir, 'model.pt')
-        noise_plot_path = os.path.join(fold_dir, 'noise_distribution.png')
-
-        best_val_loss    = float('inf')
-        early_stop_count = 0
-
-        for epoch in tqdm.tqdm(range(args.epochs),
-                                desc=f'Fold {fold_k} training', unit='epoch'):
-
-            # ---- Training ----
-            unet.train()
-            train_losses = []
-
-            for data in train_loader:
-                batch             = data['hrtf'].to(device)
-                label             = data['measurement_point'].to(device)
-                head_measurements = data['head_measurements'].to(device)
-                ears_measurements = data['ear_measurements'].to(device)
-
-                t = torch.randint(
-                    0, diffusion_model.timesteps, (batch.shape[0],),
-                    dtype=torch.long, device=device
-                )
-
-                batch_noisy, noise = diffusion_model.forward(batch, t, device)
-                batch_noisy = batch_noisy.float()
-
-                # CFG dropout: disabled by default — paper does not use CFG.
-                if args.p_uncond > 0.0 and random.random() < args.p_uncond:
-                    label             = None
-                    head_measurements = None
-                    ears_measurements = None
-
-                predicted_noise = unet(
-                    batch_noisy, t,
-                    labels         = label,
-                    head_embedding = head_measurements,
-                    ears_embedding = ears_measurements,
-                )
-
-                loss = torch.nn.functional.l1_loss(noise, predicted_noise)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                train_losses.append(loss.item())
-
-            # ---- Validation (noise-prediction loss, not full denoising) ----
-            unet.eval()
-            val_losses = []
+            x            = torch.randn(b, 2, 256, device=device)
+            labels_batch = torch.tensor(pts, device=device)
+            head_batch   = head_1.unsqueeze(0).expand(b, -1)
+            ears_batch   = ears_1.unsqueeze(0).expand(b, -1)
 
             with torch.no_grad():
-                for data in val_loader:
-                    batch             = data['hrtf'].to(device)
-                    label             = data['measurement_point'].to(device)
-                    head_measurements = data['head_measurements'].to(device)
-                    ears_measurements = data['ear_measurements'].to(device)
-
-                    t = torch.randint(
-                        0, diffusion_model.timesteps, (batch.shape[0],),
-                        dtype=torch.long, device=device
-                    )
-
-                    batch_noisy, noise = diffusion_model.forward(batch, t, device)
-                    batch_noisy = batch_noisy.float()
+                for i in reversed(range(diffusion_model.timesteps)):
+                    t_batch      = torch.full((b,), i, dtype=torch.long, device=device)
+                    betas_t      = betas_gpu[i].view(1, 1, 1)
+                    sqrt_recip_t = sqrt_recip_alphas_gpu[i].view(1, 1, 1)
+                    sqrt_omacp_t = sqrt_one_minus_acp_gpu[i].view(1, 1, 1)
 
                     predicted_noise = unet(
-                        batch_noisy, t,
-                        labels         = label,
-                        head_embedding = head_measurements,
-                        ears_embedding = ears_measurements,
+                        x, t_batch,
+                        labels=labels_batch,
+                        head_embedding=head_batch,
+                        ears_embedding=ears_batch,
                     )
-                    val_losses.append(
-                        torch.nn.functional.l1_loss(noise, predicted_noise).item()
-                    )
+                    mean = sqrt_recip_t * (x - betas_t * predicted_noise / sqrt_omacp_t)
+                    x = mean + (torch.sqrt(betas_t) * torch.randn_like(x) if i > 0 else 0)
 
-            mean_train = np.mean(train_losses)
-            mean_val   = np.mean(val_losses)
+            all_results.append(x.cpu())
 
-            if args.verbose or epoch % 50 == 0:
-                print(f'  Epoch {epoch:4d} | Train {mean_train:.6f} | '
-                      f'Val {mean_val:.6f} | '
-                      f'Patience {early_stop_count}/{args.early_stop_patience} | '
-                      f'LR {scheduler.get_last_lr()[0]:.2e}')
+        results_tensor = torch.cat(all_results, dim=0)   # (n_points, 2, 256)
 
-            if mean_val < best_val_loss:
-                best_val_loss    = mean_val
-                early_stop_count = 0
-                torch.save(unet.state_dict(), model_path)
-                if args.verbose:
-                    print(f'  ✓ Saved (val {best_val_loss:.6f})')
-                with torch.no_grad():
-                    plot_noise_distribution(
-                        noise.detach().cpu(),
-                        predicted_noise.detach().cpu(),
-                        epoch,
-                        plot_path=noise_plot_path,
-                    )
-            else:
-                early_stop_count += 1
-                if early_stop_count > args.early_stop_patience:
-                    print(f'  Early stopping at epoch {epoch}.')
-                    break
+        # ── Metrics, plots, saving ────────────────────────────────────────────
+        gen_hrirs_mat  = []
+        gt_hrirs_mat   = []
 
-            scheduler.step()
+        for j, c in enumerate(valid_points):
+            audio_result = results_tensor[j]
+            hrir_test    = gt_hrirs[j]
 
-        print(f'Fold {fold_k} training complete. Best val loss: {best_val_loss:.6f}')
+            if torch.isnan(audio_result).any():
+                print(f"  NaN: subject {subject_id}, point {c} — skipping")
+                continue
 
-        # ---- Inference on this fold's test set ----
-        print(f'Running inference on fold {fold_k} test subjects…')
-        unet.load_state_dict(torch.load(model_path, map_location=device))
-        unet.eval()
+            err = nmse(hrir_test=hrir_test, hrir_gen=audio_result)
+            nmse_sub.append(err.item())
 
-        norm_mean = train_dataset.norm_mean
-        norm_std  = train_dataset.norm_std
-
-        subject_items = defaultdict(list)
-        for item in test_dataset.items:
-            subject_items[item['subject_id']].append(item)
-
-        fold_lsd_v1 = []
-        fold_lsd_v2 = []
-
-        for subject_id, items in subject_items.items():
-            hrir_gt_list, hrir_pred_list = infer_subject_batched(
-                items                = items,
-                unet                 = unet,
-                diffusion_model      = diffusion_model,
-                norm_mean            = norm_mean,
-                norm_std             = norm_std,
-                device               = device,
-                inference_batch_size = args.inference_batch_size,
+            # Save .wav (denormalised)
+            hrir_save = (audio_result * g_std) + g_mean
+            torchaudio.save(
+                uri=os.path.join(sub_wav_dir, f'pos_{c}.wav'),
+                src=hrir_save, sample_rate=44100,
             )
 
-            lsd_v1, (lsd_v1_l, lsd_v1_r) = lsd_paper(hrir_gt_list, hrir_pred_list)
-            lsd_v2 = lsd_corrected(hrir_gt_list, hrir_pred_list)
+            hrir_sub.append(audio_result)
+            hrir_tsub.append(hrir_test)
+            gen_hrirs_mat.append(audio_result.numpy())
+            gt_hrirs_mat.append(hrir_test.numpy())
 
-            fold_lsd_v1.append(lsd_v1)
-            fold_lsd_v2.append(lsd_v2)
-
-            print(f'  Subject {subject_id:3d} | '
-                  f'LSD v1: {lsd_v1:.3f} dB [L={lsd_v1_l:.3f} R={lsd_v1_r:.3f}] | '
-                  f'LSD v2: {lsd_v2:.3f} dB')
-
-            scipy.io.savemat(
-                os.path.join(fold_dir, f'sub_{subject_id}_results.mat'),
+        # ── Per-subject .mat ──────────────────────────────────────────────────
+        if gen_hrirs_mat:
+            sio.savemat(
+                os.path.join(mat_fold, f'sub_{subject_id}.mat'),
                 {
-                    f'sub_{subject_id}_pred':     np.stack(hrir_pred_list),
-                    f'sub_{subject_id}_gt':       np.stack(hrir_gt_list),
-                    f'sub_{subject_id}_lsd_v1':   lsd_v1,
-                    f'sub_{subject_id}_lsd_v1_l': lsd_v1_l,
-                    f'sub_{subject_id}_lsd_v1_r': lsd_v1_r,
-                    f'sub_{subject_id}_lsd_v2':   lsd_v2,
+                    'hrir_gen':    np.array(gen_hrirs_mat),   # (n_points, 2, 256)
+                    'hrir_gt':     np.array(gt_hrirs_mat),
+                    'nmse_values': np.array(nmse_sub),
+                    'subject_id':  subject_id,
+                    'positions':   np.array(valid_points),
                 }
             )
 
-        fold_mean_v1 = float(np.mean(fold_lsd_v1))
-        fold_mean_v2 = float(np.mean(fold_lsd_v2))
-        all_fold_lsd_v1.append(fold_mean_v1)
-        all_fold_lsd_v2.append(fold_mean_v2)
+        # ── Per-subject HRIR overlay plot → disk + TensorBoard ───────────────
+        if hrir_sub:
+            lsd_val = lsd(hrir_tsub, hrir_sub, len(hrir_sub), sr=44100)
+            fold_lsd.append(lsd_val)
+            fold_nmse.extend(nmse_sub)
 
-        print(f'Fold {fold_k} mean LSD — v1: {fold_mean_v1:.3f} dB | '
-              f'v2: {fold_mean_v2:.3f} dB')
+            # Sample plot: first DOA of the subject
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            axes[0].plot(hrir_tsub[0][0].numpy(),  label='GT L',  linewidth=0.8)
+            axes[0].plot(hrir_sub[0][0].numpy(),   label='Gen L', linewidth=0.8, linestyle='--')
+            axes[0].set_title('Left channel — DOA 0')
+            axes[0].legend(); axes[0].grid()
 
-        scipy.io.savemat(
-            os.path.join(fold_dir, 'fold_summary.mat'),
+            axes[1].plot(hrir_tsub[0][1].numpy(),  label='GT R',  linewidth=0.8)
+            axes[1].plot(hrir_sub[0][1].numpy(),   label='Gen R', linewidth=0.8, linestyle='--')
+            axes[1].set_title('Right channel — DOA 0')
+            axes[1].legend(); axes[1].grid()
+
+            fig.suptitle(f'Subject {subject_id} | LSD={lsd_val:.3f} dB  '
+                         f'NMSE={np.mean(nmse_sub):.4f}')
+            plot_file = os.path.join(plot_fold, f'sub_{subject_id}_hrir.png')
+            fig.savefig(plot_file, dpi=100, bbox_inches='tight')
+            plt.close(fig)
+
+            # Push to TensorBoard under Inference/
+            from PIL import Image
+            import torchvision.transforms.functional as tvf
+            img_tensor = tvf.to_tensor(Image.open(plot_file))
+            writer.add_image(f'Inference/sub_{subject_id}_hrir', img_tensor, fold_idx + 1)
+            writer.add_scalar(f'Inference/LSD_sub_{subject_id}',  lsd_val,             fold_idx + 1)
+            writer.add_scalar(f'Inference/NMSE_sub_{subject_id}', np.mean(nmse_sub),   fold_idx + 1)
+
+            print(f"  Subject {subject_id}: LSD={lsd_val:.3f} dB  "
+                  f"NMSE={np.mean(nmse_sub):.4f}")
+
+        # ── Persist progress ──────────────────────────────────────────────────
+        progress['done_subjects'].append(subject_id)
+        progress['lsd']  = fold_lsd
+        progress['nmse'] = fold_nmse
+        with open(progress_path, 'w') as f:
+            json.dump(progress, f)
+
+    # ── Fold-level summary scalars ─────────────────────────────────────────────
+    if fold_lsd:
+        writer.add_scalar('Inference/mean_LSD',  np.mean(fold_lsd),  fold_idx + 1)
+        writer.add_scalar('Inference/mean_NMSE', np.mean(fold_nmse), fold_idx + 1)
+
+        # Fold-level .mat
+        sio.savemat(
+            os.path.join(MAT_DIR, f'fold_{fold_idx + 1}_summary.mat'),
             {
-                'test_subject_ids':   np.array(test_subject_ids),
-                'mean_lsd_v1':        fold_mean_v1,
-                'mean_lsd_v2':        fold_mean_v2,
-                'per_subject_lsd_v1': np.array(fold_lsd_v1),
-                'per_subject_lsd_v2': np.array(fold_lsd_v2),
+                'lsd_per_subject':  np.array(fold_lsd),
+                'nmse_per_position': np.array(fold_nmse),
+                'test_subjects':    np.array(split['test_subjects']),
+                'mean_lsd':         float(np.mean(fold_lsd)),
+                'mean_nmse':        float(np.mean(fold_nmse)),
             }
         )
 
-    # ---- Cross-fold summary ----
-    print(f"\n{'='*60}")
-    print(f'{K}-FOLD CROSS-VALIDATION SUMMARY')
-    print(f"{'='*60}")
-    print(f'LSD v1 (paper, K=44, 0-15 kHz): '
-          f'{np.mean(all_fold_lsd_v1):.3f} ± {np.std(all_fold_lsd_v1):.3f} dB')
-    print(f'LSD v2 (corrected, 87 bins):     '
-          f'{np.mean(all_fold_lsd_v2):.3f} ± {np.std(all_fold_lsd_v2):.3f} dB')
-    print(f'Per-fold v1: {[f"{x:.3f}" for x in all_fold_lsd_v1]}')
-    print(f'Per-fold v2: {[f"{x:.3f}" for x in all_fold_lsd_v2]}')
-
-    scipy.io.savemat(
-        os.path.join(args.results_dir, 'cv_summary.mat'),
-        {
-            'n_folds':          K,
-            'mean_lsd_v1':      float(np.mean(all_fold_lsd_v1)),
-            'std_lsd_v1':       float(np.std(all_fold_lsd_v1)),
-            'mean_lsd_v2':      float(np.mean(all_fold_lsd_v2)),
-            'std_lsd_v2':       float(np.std(all_fold_lsd_v2)),
-            'per_fold_lsd_v1':  np.array(all_fold_lsd_v1),
-            'per_fold_lsd_v2':  np.array(all_fold_lsd_v2),
-        }
-    )
+    writer.flush()
+    writer.close()
+    print(f"  Fold {fold_idx + 1} — mean LSD={np.mean(fold_lsd):.3f} dB  "
+          f"mean NMSE={np.mean(fold_nmse):.4f}")
+    return fold_lsd, fold_nmse
 
 
-# ---------------------------------------------------------------------------
-# Inference-only mode
-# ---------------------------------------------------------------------------
+# ═════════════════════════════════════════════════════════════════════════════
+# MAIN DISPATCH
+# ═════════════════════════════════════════════════════════════════════════════
+if args.mode == 'train':
+    all_val_losses = []
+    for fi in fold_indices:
+        all_val_losses.append(train_fold(fi, splits[fi]))
+
+    if len(all_val_losses) > 1:
+        print(f"\nCross-validation summary:")
+        print(f"  Per-fold val losses : {[f'{v:.4f}' for v in all_val_losses]}")
+        print(f"  Mean ± std          : "
+              f"{np.mean(all_val_losses):.4f} ± {np.std(all_val_losses):.4f}")
+
 else:
-    print('Inference mode: loading saved fold models from results_dir…')
+    subj_point_index = build_subject_point_index(hutubs_dataset)
+    all_lsd, all_nmse_vals = [], []
 
-    all_fold_lsd_v1 = []
-    all_fold_lsd_v2 = []
+    for fi in fold_indices:
+        fl, fn = infer_fold(fi, splits[fi], subj_point_index)
+        all_lsd.extend(fl)
+        all_nmse_vals.extend(fn)
 
-    for fold_k in range(K):
-        fold_dir   = os.path.join(args.results_dir, f'fold_{fold_k}')
-        model_path = os.path.join(fold_dir, 'model.pt')
+    if all_lsd:
+        print(f"\nOverall LSD  : {np.mean(all_lsd):.3f} ± {np.std(all_lsd):.3f} dB")
+        print(f"Overall NMSE : {np.mean(all_nmse_vals):.4f} ± {np.std(all_nmse_vals):.4f}")
 
-        if not os.path.exists(model_path):
-            print(f'  Fold {fold_k}: no model at {model_path}, skipping.')
-            continue
-
-        test_subject_ids  = fold_assignments[fold_k]
-        train_subject_ids = [
-            sid for i, fold in enumerate(fold_assignments)
-            for sid in fold
-            if i != fold_k and i != (fold_k + 1) % K
-        ]
-
-        # Load training-set normalisation stats.
-        train_dataset = HUTUBSDataset(
-            hrtf_directory  = args.hrtf_directory,
-            anthro_csv_path = args.anthro_csv_path,
-            subject_ids     = train_subject_ids,
-            augment         = False,
+        # Global summary .mat
+        sio.savemat(
+            os.path.join(MAT_DIR, 'all_folds_summary.mat'),
+            {
+                'lsd_all':  np.array(all_lsd),
+                'nmse_all': np.array(all_nmse_vals),
+                'mean_lsd':  float(np.mean(all_lsd)),
+                'mean_nmse': float(np.mean(all_nmse_vals)),
+            }
         )
-        norm_kwargs = dict(
-            norm_mean        = train_dataset.norm_mean,
-            norm_std         = train_dataset.norm_std,
-            norm_anthro_mean = train_dataset.norm_anthro_mean,
-            norm_anthro_std  = train_dataset.norm_anthro_std,
-        )
-        test_dataset = HUTUBSDataset(
-            hrtf_directory  = args.hrtf_directory,
-            anthro_csv_path = args.anthro_csv_path,
-            subject_ids     = test_subject_ids,
-            augment         = False,
-            **norm_kwargs,
-        )
-
-        unet = make_unet()
-        unet.load_state_dict(torch.load(model_path, map_location=device))
-        unet.eval().to(device)
-
-        norm_mean = train_dataset.norm_mean
-        norm_std  = train_dataset.norm_std
-
-        subject_items = defaultdict(list)
-        for item in test_dataset.items:
-            subject_items[item['subject_id']].append(item)
-
-        fold_lsd_v1 = []
-        fold_lsd_v2 = []
-
-        for subject_id, items in tqdm.tqdm(subject_items.items(),
-                                            desc=f'Fold {fold_k}', unit='subject'):
-            hrir_gt_list, hrir_pred_list = infer_subject_batched(
-                items                = items,
-                unet                 = unet,
-                diffusion_model      = diffusion_model,
-                norm_mean            = norm_mean,
-                norm_std             = norm_std,
-                device               = device,
-                inference_batch_size = args.inference_batch_size,
-            )
-
-            lsd_v1, (lsd_v1_l, lsd_v1_r) = lsd_paper(hrir_gt_list, hrir_pred_list)
-            lsd_v2 = lsd_corrected(hrir_gt_list, hrir_pred_list)
-            fold_lsd_v1.append(lsd_v1)
-            fold_lsd_v2.append(lsd_v2)
-
-            print(f'  Fold {fold_k} Sub {subject_id:3d} | '
-                  f'v1: {lsd_v1:.3f} dB [L={lsd_v1_l:.3f} R={lsd_v1_r:.3f}] | '
-                  f'v2: {lsd_v2:.3f} dB')
-
-            scipy.io.savemat(
-                os.path.join(fold_dir, f'sub_{subject_id}_results.mat'),
-                {
-                    f'sub_{subject_id}_pred':     np.stack(hrir_pred_list),
-                    f'sub_{subject_id}_gt':       np.stack(hrir_gt_list),
-                    f'sub_{subject_id}_lsd_v1':   lsd_v1,
-                    f'sub_{subject_id}_lsd_v1_l': lsd_v1_l,
-                    f'sub_{subject_id}_lsd_v1_r': lsd_v1_r,
-                    f'sub_{subject_id}_lsd_v2':   lsd_v2,
-                }
-            )
-
-        fold_mean_v1 = float(np.mean(fold_lsd_v1))
-        fold_mean_v2 = float(np.mean(fold_lsd_v2))
-        all_fold_lsd_v1.append(fold_mean_v1)
-        all_fold_lsd_v2.append(fold_mean_v2)
-        print(f'Fold {fold_k} mean — v1: {fold_mean_v1:.3f} | v2: {fold_mean_v2:.3f}')
-
-    print(f"\n{'='*60}")
-    print(f'{K}-FOLD SUMMARY')
-    print(f'LSD v1: {np.mean(all_fold_lsd_v1):.3f} ± {np.std(all_fold_lsd_v1):.3f} dB')
-    print(f'LSD v2: {np.mean(all_fold_lsd_v2):.3f} ± {np.std(all_fold_lsd_v2):.3f} dB')
+        # Also save Excel for convenience
+        pd.DataFrame({'lsd': all_lsd}).to_excel(
+            os.path.join(RES_DIR, 'lsd_values.xlsx'), index=False)
+        pd.DataFrame({'nmse': all_nmse_vals}).to_excel(
+            os.path.join(RES_DIR, 'nmse_values.xlsx'), index=False)
