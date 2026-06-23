@@ -88,9 +88,6 @@ parser.add_argument('--timesteps',           type=int,   default=600,
 parser.add_argument('--start_fold',          type=int,   default=0,
                     help='Resume training from this fold index (default: 0). '
                          'Folds below this value are skipped entirely.')
-parser.add_argument('--inference_batch_size', type=int, default=440,
-                    help='Number of HRTF positions denoised in parallel during inference. '
-                         'Use 440 to process one full HUTUBS subject at once; lower this if you run out of GPU memory.')
 parser.add_argument('--verbose',             action='store_true')
 args = parser.parse_args()
 
@@ -98,8 +95,8 @@ os.makedirs(args.results_dir, exist_ok=True)
 
 if args.verbose:
     print(f'folds={args.folds}, start_fold={args.start_fold}, timesteps={args.timesteps}, lr={args.lr}, '
-          f'batch_size={args.batch_size}, inference_batch_size={args.inference_batch_size}, '
-          f'early_stop={args.early_stop_patience}, p_uncond={args.p_uncond}')
+          f'batch_size={args.batch_size}, early_stop={args.early_stop_patience}, '
+          f'p_uncond={args.p_uncond}')
 
 
 # ---------------------------------------------------------------------------
@@ -141,70 +138,6 @@ def make_unet():
         ears_embedding    = True,
         sequence_channels = (4, 8, 16, 32, 64),    # paper Section III-C
     )
-
-
-def _stack_subject_chunk(items, start, end, device):
-    """Create one inference batch from a subject's measurement-position items.
-
-    The old code denoised one measurement position at a time. This helper keeps
-    the same conditioning information but stacks positions into a batch so the
-    600 reverse-diffusion steps run in parallel on the GPU.
-    """
-    chunk = items[start:end]
-
-    hrir_gt = torch.stack([item['hrtf'] for item in chunk], dim=0)
-    head = torch.stack([item['head_measurements'] for item in chunk], dim=0).float().to(device)
-    ears = torch.stack([item['ear_measurements'] for item in chunk], dim=0).float().to(device)
-    labels = torch.tensor(
-        [item['measurement_point'] for item in chunk],
-        dtype=torch.long,
-        device=device,
-    )
-
-    return hrir_gt, head, ears, labels
-
-
-def infer_subject_batched(items, unet, diffusion_model, norm_mean, norm_std, device, inference_batch_size):
-    """Generate predictions for all measurement positions of one subject.
-
-    This is mathematically the same reverse DDPM loop as the original inference
-    code, but it processes many positions simultaneously. The output order is
-    preserved, so LSD and the saved .mat files are computed in the same order as
-    before.
-    """
-    if inference_batch_size <= 0:
-        raise ValueError('--inference_batch_size must be a positive integer')
-
-    hrir_gt_list = []
-    hrir_pred_list = []
-
-    with torch.inference_mode():
-        for start in range(0, len(items), inference_batch_size):
-            end = min(start + inference_batch_size, len(items))
-            hrir_gt, head, ears, labels = _stack_subject_chunk(items, start, end, device)
-
-            batch_size = end - start
-            L = hrir_gt.shape[-1]
-            audio_result = torch.randn((batch_size, 2, L), device=device)
-
-            for i in reversed(range(diffusion_model.timesteps)):
-                t = torch.full((batch_size,), i, dtype=torch.long, device=device)
-                audio_result = diffusion_model.backward(
-                    x              = audio_result,
-                    t              = t,
-                    model          = unet,
-                    labels         = labels,
-                    head_embedding = head,
-                    ears_embedding = ears,
-                )
-
-            pred_denorm = (audio_result.detach().cpu() * norm_std) + norm_mean
-            gt_denorm = (hrir_gt.cpu() * norm_std) + norm_mean
-
-            hrir_pred_list.extend(pred_denorm.numpy())
-            hrir_gt_list.extend(gt_denorm.numpy())
-
-    return hrir_gt_list, hrir_pred_list
 
 
 # ---------------------------------------------------------------------------
@@ -424,15 +357,36 @@ if args.training:
         fold_lsd_v2 = []
 
         for subject_id, items in subject_items.items():
-            hrir_gt_list, hrir_pred_list = infer_subject_batched(
-                items                = items,
-                unet                 = unet,
-                diffusion_model      = diffusion_model,
-                norm_mean            = norm_mean,
-                norm_std             = norm_std,
-                device               = device,
-                inference_batch_size = args.inference_batch_size,
-            )
+            hrir_gt_list   = []
+            hrir_pred_list = []
+
+            for item in items:
+                hrir_gt = item['hrtf']
+                head    = item['head_measurements'].unsqueeze(0).float().to(device)
+                ears    = item['ear_measurements'].unsqueeze(0).float().to(device)
+                label   = torch.tensor(
+                    [item['measurement_point']], dtype=torch.long, device=device
+                )
+
+                L = hrir_gt.shape[-1]
+                audio_result = torch.randn((1, 2, L), device=device)
+
+                with torch.no_grad():
+                    for i in reversed(range(diffusion_model.timesteps)):
+                        t = torch.full((1,), i, dtype=torch.long, device=device)
+                        audio_result = diffusion_model.backward(
+                            x              = audio_result,
+                            t              = t,
+                            model          = unet,
+                            labels         = label,
+                            head_embedding = head,
+                            ears_embedding = ears,
+                        )
+
+                pred_denorm = (audio_result[0].detach().cpu() * norm_std) + norm_mean
+                gt_denorm   = (hrir_gt * norm_std) + norm_mean
+                hrir_gt_list.append(gt_denorm.numpy())
+                hrir_pred_list.append(pred_denorm.numpy())
 
             lsd_v1, (lsd_v1_l, lsd_v1_r) = lsd_paper(hrir_gt_list, hrir_pred_list)
             lsd_v2 = lsd_corrected(hrir_gt_list, hrir_pred_list)
@@ -561,15 +515,31 @@ else:
 
         for subject_id, items in tqdm.tqdm(subject_items.items(),
                                             desc=f'Fold {fold_k}', unit='subject'):
-            hrir_gt_list, hrir_pred_list = infer_subject_batched(
-                items                = items,
-                unet                 = unet,
-                diffusion_model      = diffusion_model,
-                norm_mean            = norm_mean,
-                norm_std             = norm_std,
-                device               = device,
-                inference_batch_size = args.inference_batch_size,
-            )
+            hrir_gt_list   = []
+            hrir_pred_list = []
+
+            for item in items:
+                hrir_gt = item['hrtf']
+                head    = item['head_measurements'].unsqueeze(0).float().to(device)
+                ears    = item['ear_measurements'].unsqueeze(0).float().to(device)
+                label   = torch.tensor(
+                    [item['measurement_point']], dtype=torch.long, device=device
+                )
+                L = hrir_gt.shape[-1]
+                audio_result = torch.randn((1, 2, L), device=device)
+
+                with torch.no_grad():
+                    for i in reversed(range(diffusion_model.timesteps)):
+                        t = torch.full((1,), i, dtype=torch.long, device=device)
+                        audio_result = diffusion_model.backward(
+                            x=audio_result, t=t, model=unet,
+                            labels=label, head_embedding=head, ears_embedding=ears,
+                        )
+
+                pred_denorm = (audio_result[0].detach().cpu() * norm_std) + norm_mean
+                gt_denorm   = (hrir_gt * norm_std) + norm_mean
+                hrir_gt_list.append(gt_denorm.numpy())
+                hrir_pred_list.append(pred_denorm.numpy())
 
             lsd_v1, (lsd_v1_l, lsd_v1_r) = lsd_paper(hrir_gt_list, hrir_pred_list)
             lsd_v2 = lsd_corrected(hrir_gt_list, hrir_pred_list)
