@@ -108,8 +108,9 @@ class DiffusionModel:
         # A non-empty Tensor is always truthy, so the else branch (adding noise)
         # was never executed, making the sampler fully deterministic.
         # Fixed to t.item() == 0.
-        if t.item() == 0:
+        if torch.all(t == 0):
             return mean
+
         else:
             noise = torch.randn_like(x)
             return mean + torch.sqrt(betas_t) * noise
