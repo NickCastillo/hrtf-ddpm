@@ -13,6 +13,17 @@ pinna per ear), but HUTUBS provides a related but non-identical set. We use
 all 37 available features rather than dropping valid measurements. This is
 documented as a methodological note in the thesis.
 
+Anthropometric normalisation
+----------------------------
+Features are normalised with a sigmoid transform rather than z-score:
+  sigmoid((x - μ) / σ)
+where μ and σ are the mean and std computed across ALL anthropometric values
+(head + ear features jointly) from the training set only. This maps every
+feature into (0, 1) regardless of original scale, which is beneficial for
+HUTUBS where head/torso features (mm) and pinna angles (degrees) differ by
+an order of magnitude. The single shared μ/σ scalar (not per-feature) matches
+the original author's implementation and keeps the interface simple.
+
 Ear-mirroring augmentation
 --------------------------
 For each real (subject, DOA) training item, a mirrored counterpart is appended:
@@ -102,8 +113,11 @@ class HUTUBSDataset(Dataset):
         If True, append azimuth-mirrored copies of every item (training only).
     norm_mean, norm_std : torch.Tensor or None
         Global HRIR normalisation stats. None = compute from this split.
-    norm_head_mean, norm_head_std : torch.Tensor or None
-    norm_ears_mean, norm_ears_std : torch.Tensor or None
+    norm_anthro_mean, norm_anthro_std : torch.Tensor or None
+        Shared scalar stats for sigmoid anthropometric normalisation.
+        Computed jointly across all head + ear features from the training set.
+        Pass the training-set values to val/test datasets to avoid data leakage.
+        None = compute from this split (training dataset only).
     """
 
     def __init__(
@@ -114,10 +128,8 @@ class HUTUBSDataset(Dataset):
         augment=False,
         norm_mean=None,
         norm_std=None,
-        norm_head_mean=None,
-        norm_head_std=None,
-        norm_ears_mean=None,
-        norm_ears_std=None,
+        norm_anthro_mean=None,
+        norm_anthro_std=None,
     ):
         self.hrtf_directory     = hrtf_directory
         self.anthro_csv_path    = anthro_csv_path
@@ -126,15 +138,13 @@ class HUTUBSDataset(Dataset):
 
         self._load_data(
             norm_mean, norm_std,
-            norm_head_mean, norm_head_std,
-            norm_ears_mean, norm_ears_std,
+            norm_anthro_mean, norm_anthro_std,
         )
 
     def _load_data(
         self,
         norm_mean, norm_std,
-        norm_head_mean, norm_head_std,
-        norm_ears_mean, norm_ears_std,
+        norm_anthro_mean, norm_anthro_std,
     ):
         # --- 1. Anthropometric CSV ---
         # All 37 HUTUBS features used (see module docstring).
@@ -214,17 +224,26 @@ class HUTUBSDataset(Dataset):
 
         if norm_mean is None:     norm_mean     = all_hrtf.mean()
         if norm_std  is None:     norm_std      = all_hrtf.std()
-        if norm_head_mean is None: norm_head_mean = head_measurements_raw.mean()
-        if norm_head_std  is None: norm_head_std  = head_measurements_raw.std()
-        if norm_ears_mean is None: norm_ears_mean = ear_measurements_raw.mean()
-        if norm_ears_std  is None: norm_ears_std  = ear_measurements_raw.std()
 
-        self.norm_mean      = norm_mean
-        self.norm_std       = norm_std
-        self.norm_head_mean = norm_head_mean
-        self.norm_head_std  = norm_head_std
-        self.norm_ears_mean = norm_ears_mean
-        self.norm_ears_std  = norm_ears_std
+        # Shared scalar stats for sigmoid normalisation — computed jointly
+        # across all anthropometric values (head + ear) from this split.
+        # A single μ/σ keeps the transform simple and matches the author's
+        # implementation. NaN-zeroed values are excluded implicitly since
+        # they were already zeroed above before stacking.
+        if norm_anthro_mean is None or norm_anthro_std is None:
+            all_anthro = torch.cat([
+                head_measurements_raw,   # (N_csv_rows, 13)
+                ear_measurements_raw,    # (N_csv_rows, 24)
+            ], dim=1)                    # (N_csv_rows, 37)
+            if norm_anthro_mean is None:
+                norm_anthro_mean = all_anthro.mean()
+            if norm_anthro_std  is None:
+                norm_anthro_std  = all_anthro.std().clamp(min=1e-8)
+
+        self.norm_mean        = norm_mean
+        self.norm_std         = norm_std
+        self.norm_anthro_mean = norm_anthro_mean
+        self.norm_anthro_std  = norm_anthro_std
 
         # --- 6. Build normalised item list (+ optional mirrored copies) ---
         self.items = []
@@ -237,8 +256,12 @@ class HUTUBSDataset(Dataset):
                 'hrtf':              (hrtf_tensor - norm_mean) / norm_std,
                 'subject_id':        item['subject_id'],
                 'measurement_point': item['point'],
-                'head_measurements': (head_measurements_raw[row] - norm_head_mean) / norm_head_std,
-                'ear_measurements':  (ear_measurements_raw[row]  - norm_ears_mean)  / norm_ears_std,
+                'head_measurements': torch.sigmoid(
+                    (head_measurements_raw[row] - norm_anthro_mean) / norm_anthro_std
+                ),
+                'ear_measurements':  torch.sigmoid(
+                    (ear_measurements_raw[row] - norm_anthro_mean) / norm_anthro_std
+                ),
                 'global_mean':       norm_mean,
                 'global_std':        norm_std,
                 'is_mirrored':       False,
@@ -264,8 +287,12 @@ class HUTUBSDataset(Dataset):
                     'hrtf':              (hrtf_tensor[[1, 0], :] - norm_mean) / norm_std,
                     'subject_id':        item['subject_id'],
                     'measurement_point': int(self.mirror_lut[item['point']]),
-                    'head_measurements': (head_measurements_raw[row] - norm_head_mean) / norm_head_std,
-                    'ear_measurements':  (ear_mirrored - norm_ears_mean) / norm_ears_std,
+                    'head_measurements': torch.sigmoid(
+                        (head_measurements_raw[row] - norm_anthro_mean) / norm_anthro_std
+                    ),
+                    'ear_measurements':  torch.sigmoid(
+                        (ear_mirrored - norm_anthro_mean) / norm_anthro_std
+                    ),
                     'global_mean':       norm_mean,
                     'global_std':        norm_std,
                     'is_mirrored':       True,

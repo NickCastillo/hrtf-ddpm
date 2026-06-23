@@ -185,12 +185,10 @@ if args.training:
         )
 
         norm_kwargs = dict(
-            norm_mean      = train_dataset.norm_mean,
-            norm_std       = train_dataset.norm_std,
-            norm_head_mean = train_dataset.norm_head_mean,
-            norm_head_std  = train_dataset.norm_head_std,
-            norm_ears_mean = train_dataset.norm_ears_mean,
-            norm_ears_std  = train_dataset.norm_ears_std,
+            norm_mean        = train_dataset.norm_mean,
+            norm_std         = train_dataset.norm_std,
+            norm_anthro_mean = train_dataset.norm_anthro_mean,
+            norm_anthro_std  = train_dataset.norm_anthro_std,
         )
 
         val_dataset = HUTUBSDataset(
@@ -488,12 +486,10 @@ else:
             augment         = False,
         )
         norm_kwargs = dict(
-            norm_mean      = train_dataset.norm_mean,
-            norm_std       = train_dataset.norm_std,
-            norm_head_mean = train_dataset.norm_head_mean,
-            norm_head_std  = train_dataset.norm_head_std,
-            norm_ears_mean = train_dataset.norm_ears_mean,
-            norm_ears_std  = train_dataset.norm_ears_std,
+            norm_mean        = train_dataset.norm_mean,
+            norm_std         = train_dataset.norm_std,
+            norm_anthro_mean = train_dataset.norm_anthro_mean,
+            norm_anthro_std  = train_dataset.norm_anthro_std,
         )
         test_dataset = HUTUBSDataset(
             hrtf_directory  = args.hrtf_directory,
