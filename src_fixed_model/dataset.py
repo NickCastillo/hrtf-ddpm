@@ -249,13 +249,23 @@ class HUTUBSDataset(Dataset):
                 # Azimuth-mirrored counterpart:
                 #   - swap HRIR channels [L, R] → [R, L]
                 #   - replace DOA label with mirror LUT entry
-                #   - anthropometrics unchanged (bilateral symmetry)
+                #   - head anthropometrics unchanged (bilateral symmetry)
+                #   - ear anthropometrics: swap L/R halves to match channel swap.
+                #     Layout: [L_d1..L_d10, L_theta1, L_theta2,   (indices 0-11)
+                #              R_d1..R_d10, R_theta1, R_theta2]   (indices 12-23)
+                #     When HRIR channels swap, model channel 0 = right ear, so
+                #     right pinna features must move to indices 0-11. Not swapping
+                #     this causes right-ear HRIR to be paired with left pinna
+                #     features, producing a systematic L/R LSD asymmetry.
+                ear_raw      = ear_measurements_raw[row]                        # (24,)
+                ear_mirrored = torch.cat([ear_raw[12:], ear_raw[:12]], dim=0)   # swap L↔R
+
                 mirrored_item = {
                     'hrtf':              (hrtf_tensor[[1, 0], :] - norm_mean) / norm_std,
                     'subject_id':        item['subject_id'],
                     'measurement_point': int(self.mirror_lut[item['point']]),
                     'head_measurements': (head_measurements_raw[row] - norm_head_mean) / norm_head_std,
-                    'ear_measurements':  (ear_measurements_raw[row]  - norm_ears_mean)  / norm_ears_std,
+                    'ear_measurements':  (ear_mirrored - norm_ears_mean) / norm_ears_std,
                     'global_mean':       norm_mean,
                     'global_std':        norm_std,
                     'is_mirrored':       True,
