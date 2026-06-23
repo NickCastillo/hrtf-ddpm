@@ -297,8 +297,14 @@ if args.training:
 
         # Paper optimizer: Adam lr=0.001, 20% decay every 100 epochs.
         optimizer = torch.optim.Adam(unet.parameters(), lr=args.lr)
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=100, gamma=0.9
+        
+        # scheduler = torch.optim.lr_scheduler.StepLR(
+        #     optimizer, step_size=100, gamma=0.9
+        # )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+            eta_min=1e-5,
         )
 
         model_path      = os.path.join(fold_dir, 'model.pt')
