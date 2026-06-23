@@ -298,7 +298,7 @@ if args.training:
         # Paper optimizer: Adam lr=0.001, 20% decay every 100 epochs.
         optimizer = torch.optim.Adam(unet.parameters(), lr=args.lr)
         scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=100, gamma=0.8
+            optimizer, step_size=100, gamma=0.9
         )
 
         model_path      = os.path.join(fold_dir, 'model.pt')
