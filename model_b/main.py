@@ -180,13 +180,13 @@ def train_fold(fold_idx, split):
     train_loader = DataLoader(
         Subset(hutubs_dataset, split['train']),
         batch_size=args.BATCH_SIZE, shuffle=True,
-        num_workers=4, drop_last=True, collate_fn=collate_fn,
+        num_workers=2, drop_last=True, collate_fn=collate_fn,
         pin_memory=True,
     )
     val_loader = DataLoader(
         Subset(hutubs_dataset, split['val']),
         batch_size=args.BATCH_SIZE, shuffle=False,
-        num_workers=4, drop_last=False, collate_fn=collate_fn,
+        num_workers=2, drop_last=False, collate_fn=collate_fn,
         pin_memory=True,
     )
 
