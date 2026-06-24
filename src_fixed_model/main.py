@@ -511,16 +511,16 @@ def infer_fold(fold_idx, split, subj_point_index):
             import torchvision.transforms.functional as tvf
             img_tensor = tvf.to_tensor(Image.open(plot_file))
             writer.add_image(f'Inference/sub_{subject_id}_hrir', img_tensor, fold_idx + 1)
-            writer.add_scalar(f'Inference/LSD_sub_{subject_id}',  lsd_val,             fold_idx + 1)
-            writer.add_scalar(f'Inference/NMSE_sub_{subject_id}', np.mean(nmse_sub),   fold_idx + 1)
+            writer.add_scalar(f'Inference/LSD_sub_{subject_id}',  float(lsd_val),           fold_idx + 1)
+            writer.add_scalar(f'Inference/NMSE_sub_{subject_id}', float(np.mean(nmse_sub)), fold_idx + 1)
 
             print(f"  Subject {subject_id}: LSD={lsd_val:.3f} dB  "
                   f"NMSE={np.mean(nmse_sub):.4f}")
 
         # ── Persist progress ──────────────────────────────────────────────────
-        progress['done_subjects'].append(subject_id)
-        progress['lsd']  = fold_lsd
-        progress['nmse'] = fold_nmse
+        progress['done_subjects'].append(int(subject_id))
+        progress['lsd']  = [float(v) for v in fold_lsd]
+        progress['nmse'] = [float(v) for v in fold_nmse]
         with open(progress_path, 'w') as f:
             json.dump(progress, f)
 
