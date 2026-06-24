@@ -46,8 +46,12 @@ parser.add_argument('--lr_gamma', type=float, default=0.8)
 parser.add_argument('--early_stop_patience', type=int, default=200)
 parser.add_argument('--early_stop_min_epoch', type=int, default=100)
 # ── Paths ─────────────────────────────────────────────────────────────────────
-parser.add_argument('--base_dir', type=str, default='.',
-                    help='Root directory; all output folders are created under here')
+parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
+                    help='Where to save model weights and splits.json')
+parser.add_argument('--results_dir', type=str, default='./results',
+                    help='Where to save .mat files, plots, and .wav files')
+parser.add_argument('--runs_dir', type=str, default='./runs',
+                    help='Where to save TensorBoard event files')
 parser.add_argument('--k_folds', type=int, default=5)
 parser.add_argument('--hrtf_directory', type=str,
                     default='/nas/home/jalbarracin/datasets/HUTUBS/HRIRs')
@@ -58,24 +62,25 @@ args = parser.parse_args()
 
 # ── Directory layout ──────────────────────────────────────────────────────────
 #
-#   <base_dir>/
-#     runs/          ← TensorBoard event files, one sub-dir per fold
-#       fold_1/
-#       fold_2/  ...
-#     checkpoints/   ← best model weights per fold  (unet_fold1.pt ...)
-#     results/
-#       mat/         ← .mat files per subject (NMSE, LSD, generated HRIRs)
-#       plots/       ← noise-distribution PNGs and per-subject HRIR plots
-#       fold_*/      ← generated .wav files per subject/position
+#   checkpoint_dir/          ← splits.json + unet_fold1.pt ...
+#   runs_dir/                ← TensorBoard event files per fold
+#   results_dir/
+#     mat/fold_N/            ← per-subject .mat files
+#     plots/fold_N/          ← noise distribution + HRIR overlay PNGs
+#     fold_N/sub_M/          ← generated .wav files
 #
-RUNS_DIR   = os.path.join(args.base_dir, 'runs')
-CKPT_DIR   = os.path.join(args.base_dir, 'checkpoints')
-RES_DIR    = os.path.join(args.base_dir, 'results')
-MAT_DIR    = os.path.join(RES_DIR, 'mat')
-PLOTS_DIR  = os.path.join(RES_DIR, 'plots')
+CKPT_DIR  = args.checkpoint_dir
+RES_DIR   = args.results_dir
+RUNS_DIR  = args.runs_dir
+MAT_DIR   = os.path.join(RES_DIR, 'mat')
+PLOTS_DIR = os.path.join(RES_DIR, 'plots')
 
 for d in [RUNS_DIR, CKPT_DIR, RES_DIR, MAT_DIR, PLOTS_DIR]:
     os.makedirs(d, exist_ok=True)
+
+# Pre-create per-fold run dirs so TensorBoard sees them immediately
+for fi in range(5):   # max k_folds; harmless extras are ignored
+    os.makedirs(os.path.join(RUNS_DIR, f'fold_{fi + 1}'), exist_ok=True)
 
 # splits.json lives in checkpoints/ so it travels with the model weights
 SPLITS_PATH = os.path.join(CKPT_DIR, 'splits.json')
@@ -285,12 +290,12 @@ def train_fold(fold_idx, split):
         if mean_val < best_val_loss:
             best_val_loss = mean_val
             torch.save({
-                'epoch':      epoch,
+                'epoch':      torch.tensor(epoch),
                 'model_state_dict': unet.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'val_loss':   best_val_loss,
-                'fold':       fold_idx + 1,
+                'val_loss':   torch.tensor(best_val_loss),
+                'fold':       torch.tensor(fold_idx + 1),
             }, model_path)
             early_stop_count = 0
             if args.verbose:
@@ -339,7 +344,7 @@ def infer_fold(fold_idx, split, subj_point_index):
     writer = SummaryWriter(log_dir=os.path.join(RUNS_DIR, fold_tag))
 
     unet = build_unet()
-    ckpt = torch.load(model_path, map_location=device)
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
     unet.load_state_dict(ckpt['model_state_dict'])
     unet.eval()
     if hasattr(torch, 'compile'):
@@ -459,25 +464,27 @@ def infer_fold(fold_idx, split, subj_point_index):
 
             hrir_sub.append(audio_result)
             hrir_tsub.append(hrir_test)
-            gen_hrirs_mat.append(audio_result.numpy())
-            gt_hrirs_mat.append(hrir_test.numpy())
+            gen_hrirs_mat.append(audio_result.float().numpy())
+            gt_hrirs_mat.append(hrir_test.float().numpy())
 
         # ── Per-subject .mat ──────────────────────────────────────────────────
         if gen_hrirs_mat:
+            lsd_val_sub = lsd(hrir_tsub, hrir_sub, len(hrir_sub), sr=44100) if hrir_sub else float('nan')
             sio.savemat(
                 os.path.join(mat_fold, f'sub_{subject_id}.mat'),
                 {
-                    'hrir_gen':    np.array(gen_hrirs_mat),   # (n_points, 2, 256)
-                    'hrir_gt':     np.array(gt_hrirs_mat),
-                    'nmse_values': np.array(nmse_sub),
-                    'subject_id':  subject_id,
-                    'positions':   np.array(valid_points),
+                    'hrir_gen':    np.array(gen_hrirs_mat,  dtype=np.float32),  # (n_valid, 2, 256)
+                    'hrir_gt':     np.array(gt_hrirs_mat,   dtype=np.float32),
+                    'nmse_values': np.array(nmse_sub,       dtype=np.float64),
+                    'lsd_value':   np.float64(lsd_val_sub),
+                    'subject_id':  np.int32(subject_id),
+                    'positions':   np.array(valid_points,   dtype=np.int32),
                 }
             )
 
         # ── Per-subject HRIR overlay plot → disk + TensorBoard ───────────────
         if hrir_sub:
-            lsd_val = lsd(hrir_tsub, hrir_sub, len(hrir_sub), sr=44100)
+            lsd_val = lsd_val_sub
             fold_lsd.append(lsd_val)
             fold_nmse.extend(nmse_sub)
 
