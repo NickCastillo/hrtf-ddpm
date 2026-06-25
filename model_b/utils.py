@@ -2,10 +2,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-# ── LSD constants matching paper Eq. 9 ───────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 SR       = 44100
 HRIR_LEN = 256
-K_BANDS  = 44      # paper: K=44 frequency bins
+K_BANDS  = 44      # paper Eq. 9: K=44 frequency bins
 F_MAX    = 15000   # paper: 0–15 kHz
 
 
@@ -42,36 +42,160 @@ def nmse(hrir_test, hrir_gen):
     return out / 2
 
 
+def _get_freq_bins(sr=SR):
+    """Return the K=44 frequency bin indices used for LSD (shared by all callers)."""
+    freqs     = np.fft.rfftfreq(HRIR_LEN, d=1.0 / sr)
+    band_mask = freqs <= F_MAX
+    band_idx  = np.where(band_mask)[0]
+    return band_idx[np.linspace(0, len(band_idx) - 1, K_BANDS, dtype=int)]
+
+
+def _to_np(x):
+    return x.numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
+
+
+def _stack(hrirs):
+    """Stack list of (2, L) tensors/arrays → (N, 2, L) float32 array."""
+    return np.stack([_to_np(h) for h in hrirs], axis=0).astype(np.float32)
+
+
 def lsd(hrir_test, hrir_gen, points, sr=SR):
     """
     Log-Spectral Distortion — paper Eq. 9.
-
-    LSD(H, H_hat) = sqrt( 1/(L*K) * sum_l sum_k (20 log10 |H(r_l,k)| / |H_hat(r_l,k)|)^2 )
-
-    Matches paper exactly:
-      - K=44 frequency bands evenly spaced between 0 and 15 kHz
-      - Averaged over both L (ch 0) and R (ch 1) ears
-      - hrir_test / hrir_gen: lists of tensors or arrays, each shape (2, HRIR_LEN)
+    K=44 bands 0–15 kHz.
+    Returns dict with keys 'L', 'R', 'avg' (all floats, dB).
+    'avg' matches the paper exactly (L and R averaged).
     """
-    freqs     = np.fft.rfftfreq(HRIR_LEN, d=1.0 / sr)          # 129 bins
-    band_mask = freqs <= F_MAX
-    band_idx  = np.where(band_mask)[0]
-    # Evenly subsample to exactly K_BANDS within [0, F_MAX]
-    sel = band_idx[np.linspace(0, len(band_idx) - 1, K_BANDS, dtype=int)]
-
-    # Stack into arrays: (n_points, 2, HRIR_LEN)
-    def to_np(x):
-        return x.numpy() if isinstance(x, torch.Tensor) else np.array(x)
-
-    gt  = np.stack([to_np(h) for h in hrir_test],  axis=0).astype(np.float32)
-    gen = np.stack([to_np(h) for h in hrir_gen],   axis=0).astype(np.float32)
-
-    eps   = 1e-12
-    total = 0.0
+    sel = _get_freq_bins(sr)
+    gt  = _stack(hrir_test)
+    gen = _stack(hrir_gen)
+    eps = 1e-12
+    lsd_per_ch = []
     for ch in range(2):
-        H_gt  = np.abs(np.fft.rfft(gt[:,  ch, :]))[:, sel]   # (n_points, K)
+        H_gt = np.abs(np.fft.rfft(gt[:,  ch, :]))[:, sel]
         H_gen = np.abs(np.fft.rfft(gen[:, ch, :]))[:, sel]
-        log_r = 20 * np.log10((H_gt + eps) / (H_gen + eps))
-        total += np.sum(log_r ** 2)
+        sq = np.sum((20 * np.log10((H_gt + eps) / (H_gen + eps))) ** 2)
+        lsd_per_ch.append(float(np.sqrt(sq / (points * K_BANDS))))
+    return {
+        'L':   lsd_per_ch[0],
+        'R':   lsd_per_ch[1],
+        'avg': float(np.sqrt((lsd_per_ch[0]**2 + lsd_per_ch[1]**2) / 2)),
+    }
 
-    return float(np.sqrt(total / (2 * points * K_BANDS)))
+
+# ── ITD ───────────────────────────────────────────────────────────────────────
+
+def compute_itd(hrir, sr=SR):
+    """
+    Estimate ITD for a single HRIR via the peak of the cross-correlation
+    between L (ch 0) and R (ch 1) channels.
+
+    Returns ITD in microseconds. Positive = sound from the right
+    (R leads L), negative = sound from the left.
+
+    This is the standard threshold-based / cross-correlation method
+    used in the HRTF literature and consistent with the paper's
+    ITD error metric (Sec. IV-B, reported in µs).
+    """
+    h = _to_np(hrir)   # (2, L)
+    xcorr = np.correlate(h[0], h[1], mode='full')
+    lag   = np.argmax(xcorr) - (len(h[0]) - 1)   # samples
+    return float(lag / sr * 1e6)                   # → µs
+
+
+def itd_error(hrir_test_list, hrir_gen_list, sr=SR):
+    """
+    Mean absolute ITD error over all positions (µs).
+    hrir_test_list / hrir_gen_list: lists of (2, L) tensors or arrays.
+    """
+    errors = []
+    for gt, gen in zip(hrir_test_list, hrir_gen_list):
+        itd_gt  = compute_itd(gt,  sr)
+        itd_gen = compute_itd(gen, sr)
+        errors.append(abs(itd_gt - itd_gen))
+    return float(np.mean(errors))
+
+
+# ── PBC ───────────────────────────────────────────────────────────────────────
+
+def _erb_filters(sr=SR, n_filters=40, f_low=50.0):
+    """
+    Generate centre frequencies for an ERB (Equivalent Rectangular Bandwidth)
+    auditory filterbank spanning f_low to sr/2.
+
+    ERB scale per Moore & Glasberg (1983):
+        ERB(f) = 24.7 * (4.37*f/1000 + 1)
+
+    Returns array of centre frequencies in Hz.
+    """
+    f_high = sr / 2.0
+    erb_low = 24.7 * (4.37 * f_low / 1000 + 1)
+    erb_high = 24.7 * (4.37 * f_high / 1000 + 1)
+    erbs = np.linspace(erb_low, erb_high, n_filters)
+    # Invert ERB → Hz
+    cfs = (erbs / 24.7 - 1) / 4.37 * 1000
+    return cfs
+
+
+def _gammatone_response(freqs, cf, bw_factor=1.019):
+    """
+    Approximate gammatone filter magnitude response at given FFT frequencies.
+    Uses the simplified Glasberg & Moore ERB bandwidth:
+        ERB(cf) = 24.7 * (4.37*cf/1000 + 1)
+    bw_factor = 1.019 is the standard correction for a 4th-order gammatone.
+    """
+    erb = 24.7 * (4.37 * cf / 1000 + 1)
+    bw = bw_factor * erb
+    # 4th-order gammatone magnitude approximated as squared Lorentzian
+    response = 1.0 / (1.0 + ((freqs - cf) / (bw / 2)) ** 2) ** 4
+    return response / (response.max() + 1e-12)
+
+
+def pbc(hrir_test_list, hrir_gen_list, sr=SR, n_filters=40):
+    """
+    Perceptual Blur Criterion (PBC) — binaural auditory model metric.
+
+    Computes the mean spectral distortion between GT and generated HRTFs
+    weighted by an ERB gammatone filterbank, giving perceptually-weighted
+    frequency emphasis (more weight to speech-important mid frequencies).
+
+    Formula per position p, channel c, filter k:
+        D(p,c,k) = 20*log10( sum_f |H_gt(f)| * g_k(f) )
+                          - 20*log10( sum_f |H_gen(f)| * g_k(f) )
+        PBC = sqrt( mean_{p,c,k} D(p,c,k)^2 )   [dB]
+
+    This is the standard formulation used in HRTF personalisation
+    literature (Enzner 2008, Grigoriev et al.). Lower = more perceptually
+    similar. Paper reports PBC alongside LSD and ITD (Sec. IV-B).
+
+    hrir_test_list / hrir_gen_list: lists of (2, L) tensors or arrays.
+    Returns scalar float (dB).
+    """
+    gt = _stack(hrir_test_list)    # (N, 2, L)
+    gen = _stack(hrir_gen_list)
+
+    N = gt.shape[0]
+    freqs = np.fft.rfftfreq(HRIR_LEN, d=1.0 / sr)   # (129,)
+    cfs = _erb_filters(sr=sr, n_filters=n_filters)  # (n_filters,)
+
+    # Pre-compute filter responses: (n_filters, n_freqs)
+    filters = np.stack([_gammatone_response(freqs, cf) for cf in cfs], axis=0)
+
+    eps = 1e-12
+    total = 0.0
+    count = 0
+
+    for ch in range(2):
+        H_gt  = np.abs(np.fft.rfft(gt[:,  ch, :]))   # (N, 129)
+        H_gen = np.abs(np.fft.rfft(gen[:, ch, :]))   # (N, 129)
+
+        for k in range(n_filters):
+            g = filters[k]                             # (129,)
+            # Weighted energy per position
+            E_gt = H_gt  @ g + eps                   # (N,)
+            E_gen = H_gen @ g + eps                   # (N,)
+            D = 20 * np.log10(E_gt / E_gen)           # (N,)
+            total += np.sum(D ** 2)
+            count += N
+
+    return float(np.sqrt(total / count))

@@ -7,7 +7,6 @@ import scipy.io as sio
 import matplotlib
 matplotlib.use('Agg')   # non-interactive backend — safe for remote servers
 import matplotlib.pyplot as plt
-import torchaudio
 import os
 import json
 from torch.utils.data import DataLoader, Subset
@@ -15,7 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from dataset import HUTUBSDataset, collate_fn
 from model import DiffusionModel, UNet
-from utils import plot_noise_distribution, nmse, lsd
+from utils import plot_noise_distribution, nmse, lsd, itd_error, pbc
 
 # ── Device ────────────────────────────────────────────────────────────────────
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -188,13 +187,13 @@ def train_fold(fold_idx, split):
     train_loader = DataLoader(
         Subset(hutubs_dataset, split['train']),
         batch_size=args.BATCH_SIZE, shuffle=True,
-        num_workers=2, drop_last=True, collate_fn=collate_fn,
+        num_workers=4, drop_last=True, collate_fn=collate_fn,
         pin_memory=True, persistent_workers=True, prefetch_factor=4,
     )
     val_loader = DataLoader(
         Subset(hutubs_dataset, split['val']),
         batch_size=args.BATCH_SIZE, shuffle=False,
-        num_workers=2, drop_last=False, collate_fn=collate_fn,
+        num_workers=4, drop_last=False, collate_fn=collate_fn,
         pin_memory=True, persistent_workers=True, prefetch_factor=4,
     )
 
@@ -396,13 +395,17 @@ def infer_fold(fold_idx, split, subj_point_index):
             print(f"  Resuming — {len(progress['done_subjects'])} subjects already done.")
         except (json.JSONDecodeError, KeyError):
             print(f"  Warning: progress.json corrupted, starting fold fresh.")
-            progress = {'done_subjects': [], 'lsd': [], 'nmse': []}
+            progress = {'done_subjects': [], 'lsd_L': [], 'lsd_R': [], 'lsd_avg': [], 'itd': [], 'pbc': [], 'nmse': []}
     else:
         progress = {'done_subjects': [], 'lsd': [], 'nmse': []}
 
-    done_set  = set(progress['done_subjects'])
-    fold_lsd  = progress['lsd']
-    fold_nmse = progress['nmse']
+    done_set    = set(progress['done_subjects'])
+    fold_lsd_L  = progress['lsd_L']
+    fold_lsd_R  = progress['lsd_R']
+    fold_lsd_avg= progress['lsd_avg']
+    fold_itd    = progress['itd']
+    fold_pbc    = progress['pbc']
+    fold_nmse   = progress['nmse']
     INFER_BATCH = 64
 
     for subject_id in tqdm.tqdm(split['test_subjects'], desc=f'{fold_tag} infer'):
@@ -412,8 +415,6 @@ def infer_fold(fold_idx, split, subj_point_index):
         hrir_sub  = []
         hrir_tsub = []
         nmse_sub  = []
-        sub_wav_dir = os.path.join(wav_dir, f'sub_{subject_id}')
-        os.makedirs(sub_wav_dir, exist_ok=True)
 
         data_ref = hutubs_dataset[subj_point_index[(subject_id, 0)]]
         head_1 = data_ref['head_measurements'].to(device).float()
@@ -483,99 +484,110 @@ def infer_fold(fold_idx, split, subj_point_index):
             err = nmse(hrir_test=hrir_test, hrir_gen=audio_result)
             nmse_sub.append(err.item())
 
-            # Save .wav (denormalised)
-            hrir_save = (audio_result * g_std) + g_mean
-            torchaudio.save(
-                uri=os.path.join(sub_wav_dir, f'pos_{c}.wav'),
-                src=hrir_save, sample_rate=44100,
-            )
-
             hrir_sub.append(audio_result)
             hrir_tsub.append(hrir_test)
             gen_hrirs_mat.append(audio_result.float().numpy())
             gt_hrirs_mat.append(hrir_test.float().numpy())
 
-        # ── Per-subject .mat ──────────────────────────────────────────────────
+        # ── Per-subject metrics + .mat ───────────────────────────────────────
         if gen_hrirs_mat:
-            lsd_val_sub = lsd(hrir_tsub, hrir_sub, len(hrir_sub), sr=44100) if hrir_sub else float('nan')
+            n_valid      = len(hrir_sub)
+            lsd_vals     = lsd(hrir_tsub, hrir_sub, n_valid, sr=44100)
+            lsd_L_sub    = lsd_vals['L']
+            lsd_R_sub    = lsd_vals['R']
+            lsd_avg_sub  = lsd_vals['avg']
+            itd_val_sub  = itd_error(hrir_tsub, hrir_sub, sr=44100)
+            pbc_val_sub  = pbc(hrir_tsub, hrir_sub, sr=44100)
             sio.savemat(
                 os.path.join(mat_fold, f'sub_{subject_id}.mat'),
                 {
                     'hrir_gen':    np.array(gen_hrirs_mat,  dtype=np.float32),  # (n_valid, 2, 256)
                     'hrir_gt':     np.array(gt_hrirs_mat,   dtype=np.float32),
                     'nmse_values': np.array(nmse_sub,       dtype=np.float64),
-                    'lsd_value':   np.float64(lsd_val_sub),
+                    'lsd_L':       np.float64(lsd_L_sub),
+                    'lsd_R':       np.float64(lsd_R_sub),
+                    'lsd_avg':     np.float64(lsd_avg_sub),
+                    'itd_error':   np.float64(itd_val_sub),
+                    'pbc_value':   np.float64(pbc_val_sub),
                     'subject_id':  np.int32(subject_id),
                     'positions':   np.array(valid_points,   dtype=np.int32),
                 }
             )
 
-        # ── Per-subject HRIR overlay plot → disk + TensorBoard ───────────────
+        # ── Aggregate + TensorBoard per subject ─────────────────────────────
         if hrir_sub:
-            lsd_val = lsd_val_sub
-            fold_lsd.append(lsd_val)
+            fold_lsd_L.append(lsd_L_sub)
+            fold_lsd_R.append(lsd_R_sub)
+            fold_lsd_avg.append(lsd_avg_sub)
+            fold_itd.append(itd_val_sub)
+            fold_pbc.append(pbc_val_sub)
             fold_nmse.extend(nmse_sub)
 
-            # Sample plot: first DOA of the subject
-            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-            axes[0].plot(hrir_tsub[0][0].numpy(),  label='GT L',  linewidth=0.8)
-            axes[0].plot(hrir_sub[0][0].numpy(),   label='Gen L', linewidth=0.8, linestyle='--')
-            axes[0].set_title('Left channel — DOA 0')
-            axes[0].legend(); axes[0].grid()
+            writer.add_scalar(f'Inference/LSD_L_sub_{subject_id}',  float(lsd_L_sub),         fold_idx + 1)
+            writer.add_scalar(f'Inference/LSD_R_sub_{subject_id}',  float(lsd_R_sub),         fold_idx + 1)
+            writer.add_scalar(f'Inference/LSD_avg_sub_{subject_id}',float(lsd_avg_sub),        fold_idx + 1)
+            writer.add_scalar(f'Inference/ITD_sub_{subject_id}',    float(itd_val_sub),        fold_idx + 1)
+            writer.add_scalar(f'Inference/PBC_sub_{subject_id}',    float(pbc_val_sub),        fold_idx + 1)
+            writer.add_scalar(f'Inference/NMSE_sub_{subject_id}',   float(np.mean(nmse_sub)),  fold_idx + 1)
 
-            axes[1].plot(hrir_tsub[0][1].numpy(),  label='GT R',  linewidth=0.8)
-            axes[1].plot(hrir_sub[0][1].numpy(),   label='Gen R', linewidth=0.8, linestyle='--')
-            axes[1].set_title('Right channel — DOA 0')
-            axes[1].legend(); axes[1].grid()
-
-            fig.suptitle(f'Subject {subject_id} | LSD={lsd_val:.3f} dB  '
-                         f'NMSE={np.mean(nmse_sub):.4f}')
-            plot_file = os.path.join(plot_fold, f'sub_{subject_id}_hrir.png')
-            fig.savefig(plot_file, dpi=100, bbox_inches='tight')
-            plt.close(fig)
-
-            # Push to TensorBoard under Inference/
-            from PIL import Image
-            import torchvision.transforms.functional as tvf
-            img_tensor = tvf.to_tensor(Image.open(plot_file))
-            writer.add_image(f'Inference/sub_{subject_id}_hrir', img_tensor, fold_idx + 1)
-            writer.add_scalar(f'Inference/LSD_sub_{subject_id}',  float(lsd_val),           fold_idx + 1)
-            writer.add_scalar(f'Inference/NMSE_sub_{subject_id}', float(np.mean(nmse_sub)), fold_idx + 1)
-
-            print(f"  Subject {subject_id}: LSD={lsd_val:.3f} dB  "
+            print(f"  Subject {subject_id}: "
+                  f"LSD_L={lsd_L_sub:.3f}  LSD_R={lsd_R_sub:.3f}  LSD_avg={lsd_avg_sub:.3f} dB  "
+                  f"ITD={itd_val_sub:.2f} µs  "
+                  f"PBC={pbc_val_sub:.3f} dB  "
                   f"NMSE={np.mean(nmse_sub):.4f}")
 
         # ── Persist progress (atomic write — crash-safe) ──────────────────────
         progress['done_subjects'].append(int(subject_id))
-        progress['lsd']  = [float(v) for v in fold_lsd]
-        progress['nmse'] = [float(v) for v in fold_nmse]
+        progress['lsd_L']   = [float(v) for v in fold_lsd_L]
+        progress['lsd_R']   = [float(v) for v in fold_lsd_R]
+        progress['lsd_avg'] = [float(v) for v in fold_lsd_avg]
+        progress['itd']     = [float(v) for v in fold_itd]
+        progress['pbc']     = [float(v) for v in fold_pbc]
+        progress['nmse']    = [float(v) for v in fold_nmse]
         tmp_path = progress_path + '.tmp'
         with open(tmp_path, 'w') as f:
             json.dump(progress, f)
         os.replace(tmp_path, progress_path)   # atomic on POSIX and Windows
 
     # ── Fold-level summary scalars ─────────────────────────────────────────────
-    if fold_lsd:
-        writer.add_scalar('Inference/mean_LSD',  np.mean(fold_lsd),  fold_idx + 1)
-        writer.add_scalar('Inference/mean_NMSE', np.mean(fold_nmse), fold_idx + 1)
+    if fold_lsd_avg:
+        writer.add_scalar('Inference/mean_LSD_L',   float(np.mean(fold_lsd_L)),   fold_idx + 1)
+        writer.add_scalar('Inference/mean_LSD_R',   float(np.mean(fold_lsd_R)),   fold_idx + 1)
+        writer.add_scalar('Inference/mean_LSD_avg', float(np.mean(fold_lsd_avg)), fold_idx + 1)
+        writer.add_scalar('Inference/mean_ITD',     float(np.mean(fold_itd)),     fold_idx + 1)
+        writer.add_scalar('Inference/mean_PBC',     float(np.mean(fold_pbc)),     fold_idx + 1)
+        writer.add_scalar('Inference/mean_NMSE',    float(np.mean(fold_nmse)),    fold_idx + 1)
 
         # Fold-level .mat
         sio.savemat(
             os.path.join(MAT_DIR, f'fold_{fold_idx + 1}_summary.mat'),
             {
-                'lsd_per_subject':  np.array(fold_lsd),
-                'nmse_per_position': np.array(fold_nmse),
-                'test_subjects':    np.array(split['test_subjects']),
-                'mean_lsd':         float(np.mean(fold_lsd)),
-                'mean_nmse':        float(np.mean(fold_nmse)),
+                'lsd_L_per_subject':  np.array(fold_lsd_L,   dtype=np.float64),
+                'lsd_R_per_subject':  np.array(fold_lsd_R,   dtype=np.float64),
+                'lsd_avg_per_subject':np.array(fold_lsd_avg, dtype=np.float64),
+                'itd_per_subject':    np.array(fold_itd,     dtype=np.float64),
+                'pbc_per_subject':    np.array(fold_pbc,     dtype=np.float64),
+                'nmse_per_position':  np.array(fold_nmse,    dtype=np.float64),
+                'test_subjects':      np.array(split['test_subjects'], dtype=np.int32),
+                'mean_lsd_L':         float(np.mean(fold_lsd_L)),
+                'mean_lsd_R':         float(np.mean(fold_lsd_R)),
+                'mean_lsd_avg':       float(np.mean(fold_lsd_avg)),
+                'mean_itd':           float(np.mean(fold_itd)),
+                'mean_pbc':           float(np.mean(fold_pbc)),
+                'mean_nmse':          float(np.mean(fold_nmse)),
             }
         )
 
     writer.flush()
     writer.close()
-    print(f"  Fold {fold_idx + 1} — mean LSD={np.mean(fold_lsd):.3f} dB  "
-          f"mean NMSE={np.mean(fold_nmse):.4f}")
-    return fold_lsd, fold_nmse
+    print(f"  Fold {fold_idx + 1} — "
+          f"LSD_L={np.mean(fold_lsd_L):.3f}  "
+          f"LSD_R={np.mean(fold_lsd_R):.3f}  "
+          f"LSD_avg={np.mean(fold_lsd_avg):.3f} dB  "
+          f"ITD={np.mean(fold_itd):.2f} µs  "
+          f"PBC={np.mean(fold_pbc):.3f} dB  "
+          f"NMSE={np.mean(fold_nmse):.4f}")
+    return fold_lsd_L, fold_lsd_R, fold_lsd_avg, fold_itd, fold_pbc, fold_nmse
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -596,27 +608,47 @@ else:
     subj_point_index = build_subject_point_index(hutubs_dataset)
     all_lsd, all_nmse_vals = [], []
 
+    all_lsd_L, all_lsd_R, all_lsd_avg, all_itd_vals, all_pbc_vals = [], [], [], [], []
     for fi in fold_indices:
-        fl, fn = infer_fold(fi, splits[fi], subj_point_index)
-        all_lsd.extend(fl)
+        fl_L, fl_R, fl_avg, fi_itd, fi_pbc, fn = infer_fold(fi, splits[fi], subj_point_index)
+        all_lsd.extend(fl_avg)
+        all_lsd_L.extend(fl_L)
+        all_lsd_R.extend(fl_R)
+        all_lsd_avg.extend(fl_avg)
+        all_itd_vals.extend(fi_itd)
+        all_pbc_vals.extend(fi_pbc)
         all_nmse_vals.extend(fn)
 
-    if all_lsd:
-        print(f"\nOverall LSD  : {np.mean(all_lsd):.3f} ± {np.std(all_lsd):.3f} dB")
-        print(f"Overall NMSE : {np.mean(all_nmse_vals):.4f} ± {np.std(all_nmse_vals):.4f}")
+    if all_lsd_avg:
+        print(f"\nOverall LSD_L  : {np.mean(all_lsd_L):.3f} ± {np.std(all_lsd_L):.3f} dB")
+        print(f"Overall LSD_R  : {np.mean(all_lsd_R):.3f} ± {np.std(all_lsd_R):.3f} dB")
+        print(f"Overall LSD_avg: {np.mean(all_lsd_avg):.3f} ± {np.std(all_lsd_avg):.3f} dB")
+        print(f"Overall ITD    : {np.mean(all_itd_vals):.2f} ± {np.std(all_itd_vals):.2f} µs")
+        print(f"Overall PBC    : {np.mean(all_pbc_vals):.3f} ± {np.std(all_pbc_vals):.3f} dB")
+        print(f"Overall NMSE   : {np.mean(all_nmse_vals):.4f} ± {np.std(all_nmse_vals):.4f}")
 
-        # Global summary .mat
         sio.savemat(
             os.path.join(MAT_DIR, 'all_folds_summary.mat'),
             {
-                'lsd_all':  np.array(all_lsd),
-                'nmse_all': np.array(all_nmse_vals),
-                'mean_lsd':  float(np.mean(all_lsd)),
-                'mean_nmse': float(np.mean(all_nmse_vals)),
+                'lsd_L_all':  np.array(all_lsd_L,    dtype=np.float64),
+                'lsd_R_all':  np.array(all_lsd_R,    dtype=np.float64),
+                'lsd_avg_all':np.array(all_lsd_avg,  dtype=np.float64),
+                'itd_all':    np.array(all_itd_vals,  dtype=np.float64),
+                'pbc_all':    np.array(all_pbc_vals,  dtype=np.float64),
+                'nmse_all':   np.array(all_nmse_vals, dtype=np.float64),
+                'mean_lsd_L':  float(np.mean(all_lsd_L)),
+                'mean_lsd_R':  float(np.mean(all_lsd_R)),
+                'mean_lsd_avg':float(np.mean(all_lsd_avg)),
+                'mean_itd':    float(np.mean(all_itd_vals)),
+                'mean_pbc':    float(np.mean(all_pbc_vals)),
+                'mean_nmse':   float(np.mean(all_nmse_vals)),
             }
         )
-        # Also save Excel for convenience
-        pd.DataFrame({'lsd': all_lsd}).to_excel(
-            os.path.join(RES_DIR, 'lsd_values.xlsx'), index=False)
-        pd.DataFrame({'nmse': all_nmse_vals}).to_excel(
-            os.path.join(RES_DIR, 'nmse_values.xlsx'), index=False)
+        pd.DataFrame({
+            'lsd_L':  all_lsd_L,
+            'lsd_R':  all_lsd_R,
+            'lsd_avg':all_lsd_avg,
+            'itd':    all_itd_vals,
+            'pbc':    all_pbc_vals,
+            'nmse':   all_nmse_vals,
+        }).to_excel(os.path.join(RES_DIR, 'metrics_summary.xlsx'), index=False)
