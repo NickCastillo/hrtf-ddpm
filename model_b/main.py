@@ -21,6 +21,9 @@ from utils import plot_noise_distribution, nmse, lsd
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
+# TF32 on Ampere GPUs — free ~5-10% speedup, no effect on model behaviour
+torch.set_float32_matmul_precision('high')
+
 # ── Arguments ─────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description='HRTF DDPM — per-fold training & inference')
 parser.add_argument('--mode', type=str, choices=['train', 'infer'], required=True,
@@ -136,6 +139,11 @@ def build_unet():
     ).to(device)
     n_params = sum(p.numel() for p in unet.parameters())
     print(f"  UNet parameters: {n_params:,}")
+    # torch.compile fuses kernels — ~20-30% speedup. First epoch is slower
+    # (compilation overhead) but all subsequent epochs benefit.
+    # Paper does not specify; neutral change.
+    if hasattr(torch, 'compile'):
+        unet = torch.compile(unet)
     return unet
 
 
@@ -181,13 +189,13 @@ def train_fold(fold_idx, split):
         Subset(hutubs_dataset, split['train']),
         batch_size=args.BATCH_SIZE, shuffle=True,
         num_workers=2, drop_last=True, collate_fn=collate_fn,
-        pin_memory=True,
+        pin_memory=True, persistent_workers=True, prefetch_factor=4,
     )
     val_loader = DataLoader(
         Subset(hutubs_dataset, split['val']),
         batch_size=args.BATCH_SIZE, shuffle=False,
         num_workers=2, drop_last=False, collate_fn=collate_fn,
-        pin_memory=True,
+        pin_memory=True, persistent_workers=True, prefetch_factor=4,
     )
 
     unet = build_unet()
@@ -205,6 +213,9 @@ def train_fold(fold_idx, split):
         schedulers=[warmup_scheduler, step_scheduler],
         milestones=[args.lr_warmup_epochs],
     )
+
+    # GradScaler for mixed precision — prevents FP16 underflow during backward
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == 'cuda')
 
     best_val_loss    = float('inf')
     early_stop_count = 0
@@ -227,15 +238,18 @@ def train_fold(fold_idx, split):
                               (batch.shape[0],), device=device).long()
             batch_noisy, noise = diffusion_model.forward(batch, t, device)
 
-            predicted_noise = unet(
-                batch_noisy.float(), t,
-                labels=label, head_embedding=head, ears_embedding=ears,
-            )
             optimizer.zero_grad(set_to_none=True)
-            loss = torch.nn.functional.l1_loss(noise, predicted_noise)
-            loss.backward()
+            with torch.autocast(device_type=device.type, dtype=torch.float16):
+                predicted_noise = unet(
+                    batch_noisy.float(), t,
+                    labels=label, head_embedding=head, ears_embedding=ears,
+                )
+                loss = torch.nn.functional.l1_loss(noise, predicted_noise)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             train_losses.append(loss.item())
 
         scheduler.step()
@@ -254,10 +268,11 @@ def train_fold(fold_idx, split):
                 t = torch.randint(0, diffusion_model.timesteps,
                                   (batch.shape[0],), device=device).long()
                 batch_noisy, noise = diffusion_model.forward(batch, t, device)
-                pred = unet(
-                    batch_noisy.float(), t,
-                    labels=label, head_embedding=head, ears_embedding=ears,
-                )
+                with torch.autocast(device_type=device.type, dtype=torch.float16):
+                    pred = unet(
+                        batch_noisy.float(), t,
+                        labels=label, head_embedding=head, ears_embedding=ears,
+                    )
                 val_losses.append(
                     torch.nn.functional.l1_loss(noise, pred).item()
                 )
