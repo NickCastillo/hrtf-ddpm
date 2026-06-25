@@ -397,7 +397,7 @@ def infer_fold(fold_idx, split, subj_point_index):
             print(f"  Warning: progress.json corrupted, starting fold fresh.")
             progress = {'done_subjects': [], 'lsd_L': [], 'lsd_R': [], 'lsd_avg': [], 'itd': [], 'pbc': [], 'nmse': []}
     else:
-        progress = {'done_subjects': [], 'lsd': [], 'nmse': []}
+        progress = {'done_subjects': [], 'lsd_L': [], 'lsd_R': [], 'lsd_avg': [], 'itd': [], 'pbc': [], 'nmse': []}
 
     done_set    = set(progress['done_subjects'])
     fold_lsd_L  = progress['lsd_L']
