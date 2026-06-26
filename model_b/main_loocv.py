@@ -126,8 +126,8 @@ print(f"LOOCV rounds to run: {len(test_subjects)} "
 # Seed fixed so val set is reproducible across restarts.
 rng = np.random.default_rng(42)
 val_pool = [s for s in all_subjects if s not in set(test_subjects)]
-val_fixed = list(rng.choice(val_pool, size=min(args.val_subjects, len(val_pool)),
-                             replace=False))
+val_fixed = [int(x) for x in rng.choice(val_pool, size=min(args.val_subjects, len(val_pool)),
+                                              replace=False)]
 print(f"Fixed validation subjects (all rounds): {sorted(val_fixed)}")
 
 # Save the val set alongside checkpoints for reproducibility
