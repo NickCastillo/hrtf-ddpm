@@ -75,6 +75,8 @@ parser.add_argument('--hrtf_directory', type=str,
 parser.add_argument('--anthro_csv_path', type=str,
                     default='/nas/home/jalbarracin/datasets/HUTUBS/AntrhopometricMeasures.csv')
 parser.add_argument('--verbose', action='store_true')
+parser.add_argument('--resume', action='store_true',
+                    help='Resume training from existing checkpoint for each subject')
 args = parser.parse_args()
 
 # Insert model_b source so imports resolve correctly
@@ -222,14 +224,14 @@ def train_round(test_subject_id):
     train_loader = DataLoader(
         Subset(hutubs_dataset, train_indices),
         batch_size=args.BATCH_SIZE, shuffle=True,
-        num_workers=4, drop_last=True, collate_fn=collate_fn,
-        pin_memory=True, persistent_workers=True, prefetch_factor=4,
+        num_workers=2, drop_last=True, collate_fn=collate_fn,
+        pin_memory=True, persistent_workers=True, prefetch_factor=2,
     )
     val_loader = DataLoader(
         Subset(hutubs_dataset, val_indices),
         batch_size=args.BATCH_SIZE, shuffle=False,
-        num_workers=4, drop_last=False, collate_fn=collate_fn,
-        pin_memory=True, persistent_workers=True, prefetch_factor=4,
+        num_workers=2, drop_last=False, collate_fn=collate_fn,
+        pin_memory=True, persistent_workers=True, prefetch_factor=2,
     )
 
     unet      = build_unet()
@@ -246,15 +248,29 @@ def train_round(test_subject_id):
         optimizer, schedulers=[warmup_sched, step_sched],
         milestones=[args.lr_warmup_epochs],
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == 'cuda')
+    scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
 
     best_val_loss    = float('inf')
     early_stop_count = 0
+    start_epoch      = 0
     model_path       = ckpt_path(test_subject_id)
+
+    # ── Resume from checkpoint ────────────────────────────────────────────────
+    if args.resume and os.path.exists(model_path):
+        print(f"  Resuming from {model_path}")
+        ckpt = torch.load(model_path, map_location=device, weights_only=False)
+        unet.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        best_val_loss = float(ckpt['val_loss'])
+        start_epoch   = int(ckpt['epoch']) + 1
+        print(f"  Resumed at epoch {start_epoch}, best val loss so far: {best_val_loss:.4f}")
+    elif args.resume:
+        print(f"  No checkpoint found at {model_path} — starting fresh")
     plots_dir        = os.path.join(PLOTS_DIR, tag)
     os.makedirs(plots_dir, exist_ok=True)
 
-    for epoch in tqdm.tqdm(range(args.epochs), desc=tag, unit='epoch'):
+    for epoch in tqdm.tqdm(range(start_epoch, args.epochs), desc=tag, unit='epoch'):
 
         # ── Train ─────────────────────────────────────────────────────────────
         unet.train()
@@ -564,6 +580,15 @@ def infer_round(test_subject_id):
 if args.mode == 'train':
     val_losses = []
     for subj in test_subjects:
+        subj_ckpt = ckpt_path(subj)
+        if args.resume and os.path.exists(subj_ckpt):
+            ckpt_data = torch.load(subj_ckpt, map_location='cpu', weights_only=False)
+            resumed_epoch = int(ckpt_data['epoch'])
+            # If checkpoint is at max epochs or early stopped, skip retraining
+            if resumed_epoch >= args.epochs - 1:
+                print(f"  Subject {subj} already at epoch {resumed_epoch} — skipping")
+                val_losses.append((subj, float(ckpt_data['val_loss'])))
+                continue
         vl = train_round(subj)
         val_losses.append((subj, vl))
 
