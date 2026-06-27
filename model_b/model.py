@@ -190,7 +190,7 @@ class UNet(nn.Module):
 
     def __init__(self, audio_channels=2, time_embedding_dims=256,
                  labels=440, head_dim=13, ear_dim=24,
-                 base_channels=1):
+                 base_channels=8):
         super().__init__()
 
         seq = [m * base_channels for m in self.CHANNEL_MULTS]  # 5 levels
