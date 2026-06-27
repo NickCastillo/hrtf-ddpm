@@ -163,7 +163,7 @@ def build_unet():
         labels=NUM_CLASSES,
         head_dim=13,
         ear_dim=24,
-        base_channels=1,   # (32,64,128,256,512) — paper-like model B
+        base_channels=8,   # (32,64,128,256,512) — paper-like model B
     ).to(device)
     n = sum(p.numel() for p in unet.parameters())
     print(f"  UNet parameters: {n:,}")

@@ -134,7 +134,7 @@ def build_unet():
         labels=NUM_CLASSES,
         head_dim=13,
         ear_dim=24,
-        base_channels=8,
+        base_channels=1,
     ).to(device)
     n_params = sum(p.numel() for p in unet.parameters())
     print(f"  UNet parameters: {n_params:,}")
