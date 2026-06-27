@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
+import scipy.signal
 import torch
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -72,9 +73,9 @@ def lsd(hrir_test, hrir_gen, points, sr=SR):
     eps = 1e-12
     lsd_per_ch = []
     for ch in range(2):
-        H_gt = np.abs(np.fft.rfft(gt[:,  ch, :]))[:, sel]
+        H_gt  = np.abs(np.fft.rfft(gt[:,  ch, :]))[:, sel]
         H_gen = np.abs(np.fft.rfft(gen[:, ch, :]))[:, sel]
-        sq = np.sum((20 * np.log10((H_gt + eps) / (H_gen + eps))) ** 2)
+        sq    = np.sum((20 * np.log10((H_gt + eps) / (H_gen + eps))) ** 2)
         lsd_per_ch.append(float(np.sqrt(sq / (points * K_BANDS))))
     return {
         'L':   lsd_per_ch[0],
@@ -85,22 +86,44 @@ def lsd(hrir_test, hrir_gen, points, sr=SR):
 
 # ── ITD ───────────────────────────────────────────────────────────────────────
 
-def compute_itd(hrir, sr=SR):
+def compute_itd(hrir, sr=SR, window_n=4, prominence=0.05e7):
     """
-    Estimate ITD for a single HRIR via the peak of the cross-correlation
-    between L (ch 0) and R (ch 1) channels.
+    Estimate ITD for a single HRIR via energy-based onset detection,
+    matching the author's implementation exactly.
 
-    Returns ITD in microseconds. Positive = sound from the right
-    (R leads L), negative = sound from the left.
+    Method (per author's notebook):
+      1. Square the signal per channel → instantaneous energy
+      2. Convolve with a Hann window of length N → local energy function
+      3. Differentiate and half-wave rectify → energy novelty function
+      4. Find first peak above prominence threshold → onset sample
+      5. ITD = (onset_L - onset_R) / sr * 1e6  [µs]
 
-    This is the standard threshold-based / cross-correlation method
-    used in the HRTF literature and consistent with the paper's
-    ITD error metric (Sec. IV-B, reported in µs).
+    If no peak is found in a channel, falls back to argmax of the
+    novelty function to avoid NaN propagation.
+
+    Returns ITD in microseconds. Positive = L leads R, Negative = R leads L.
     """
-    h = _to_np(hrir)   # (2, L)
-    xcorr = np.correlate(h[0], h[1], mode='full')
-    lag   = np.argmax(xcorr) - (len(h[0]) - 1)   # samples
-    return float(lag / sr * 1e6)                   # → µs
+    h   = _to_np(hrir).astype(np.float64)   # (2, L)
+    w   = scipy.signal.windows.hann(window_n)
+    onsets = []
+
+    for ch in range(2):
+        sq      = h[ch] ** 2
+        energy  = np.convolve(sq, w ** 2, mode='same')
+        diff    = np.diff(energy)
+        diff    = np.concatenate((diff, np.array([0.0])))
+        novelty = np.where(diff > 0, diff, 0.0)   # half-wave rectify
+
+        peaks, _ = scipy.signal.find_peaks(novelty, prominence=prominence)
+        if len(peaks) > 0:
+            onset = peaks[0]
+        else:
+            # Fallback: first maximum of novelty
+            onset = int(np.argmax(novelty))
+        onsets.append(onset)
+
+    itd_samples = onsets[0] - onsets[1]             # L onset − R onset
+    return float(itd_samples / sr * 1e6)             # → µs
 
 
 def itd_error(hrir_test_list, hrir_gen_list, sr=SR):
@@ -128,10 +151,10 @@ def _erb_filters(sr=SR, n_filters=40, f_low=50.0):
 
     Returns array of centre frequencies in Hz.
     """
-    f_high = sr / 2.0
-    erb_low = 24.7 * (4.37 * f_low / 1000 + 1)
+    f_high  = sr / 2.0
+    erb_low  = 24.7 * (4.37 * f_low  / 1000 + 1)
     erb_high = 24.7 * (4.37 * f_high / 1000 + 1)
-    erbs = np.linspace(erb_low, erb_high, n_filters)
+    erbs     = np.linspace(erb_low, erb_high, n_filters)
     # Invert ERB → Hz
     cfs = (erbs / 24.7 - 1) / 4.37 * 1000
     return cfs
@@ -145,7 +168,7 @@ def _gammatone_response(freqs, cf, bw_factor=1.019):
     bw_factor = 1.019 is the standard correction for a 4th-order gammatone.
     """
     erb = 24.7 * (4.37 * cf / 1000 + 1)
-    bw = bw_factor * erb
+    bw  = bw_factor * erb
     # 4th-order gammatone magnitude approximated as squared Lorentzian
     response = 1.0 / (1.0 + ((freqs - cf) / (bw / 2)) ** 2) ** 4
     return response / (response.max() + 1e-12)
@@ -171,19 +194,19 @@ def pbc(hrir_test_list, hrir_gen_list, sr=SR, n_filters=40):
     hrir_test_list / hrir_gen_list: lists of (2, L) tensors or arrays.
     Returns scalar float (dB).
     """
-    gt = _stack(hrir_test_list)    # (N, 2, L)
+    gt  = _stack(hrir_test_list)    # (N, 2, L)
     gen = _stack(hrir_gen_list)
 
     N = gt.shape[0]
     freqs = np.fft.rfftfreq(HRIR_LEN, d=1.0 / sr)   # (129,)
-    cfs = _erb_filters(sr=sr, n_filters=n_filters)  # (n_filters,)
+    cfs   = _erb_filters(sr=sr, n_filters=n_filters)  # (n_filters,)
 
     # Pre-compute filter responses: (n_filters, n_freqs)
     filters = np.stack([_gammatone_response(freqs, cf) for cf in cfs], axis=0)
 
-    eps = 1e-12
-    total = 0.0
-    count = 0
+    eps    = 1e-12
+    total  = 0.0
+    count  = 0
 
     for ch in range(2):
         H_gt  = np.abs(np.fft.rfft(gt[:,  ch, :]))   # (N, 129)
@@ -192,7 +215,7 @@ def pbc(hrir_test_list, hrir_gen_list, sr=SR, n_filters=40):
         for k in range(n_filters):
             g = filters[k]                             # (129,)
             # Weighted energy per position
-            E_gt = H_gt  @ g + eps                   # (N,)
+            E_gt  = H_gt  @ g + eps                   # (N,)
             E_gen = H_gen @ g + eps                   # (N,)
             D = 20 * np.log10(E_gt / E_gen)           # (N,)
             total += np.sum(D ** 2)
