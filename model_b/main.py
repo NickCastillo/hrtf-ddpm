@@ -122,25 +122,31 @@ diffusion_model = DiffusionModel()   # 600 timesteps
 NUM_CLASSES = 440
 
 
+# ── Precision selection ───────────────────────────────────────────────────────
+# base_channels=16 → (64,128,256,512,1024): large model prone to FP16 overflow.
+# All other base_channels use FP16 autocast for speed.
+BASE_CHANNELS = 16
+USE_FP16 = (BASE_CHANNELS != 16)
+PRECISION_DTYPE = torch.float16 if USE_FP16 else torch.float32
+print(f"Precision: {'FP16 (autocast)' if USE_FP16 else 'FP32 (large model — NaN-safe)'}")
+
+
 def build_unet():
     """
-    Paper architecture: channel mults (4,8,16,32,64) x base_channels, 5 encoder blocks,
-    self-attention after every encoder block (4 heads).
-    base_channels=8 gives (32,64,128,256,512). Set to 1 for literal paper sizes.
-    head_dim=13, ear_dim=24: all HUTUBS anthropometric features kept.
+    Paper architecture: channel mults (4,8,16,32,64) x BASE_CHANNELS, 5 encoder blocks.
+    BASE_CHANNELS=8  → (32,  64, 128, 256,  512) default
+    BASE_CHANNELS=16 → (64, 128, 256, 512, 1024) large / paper channel sizes
+    BASE_CHANNELS=1  → (4,    8,  16,  32,   64) literal paper (too narrow)
     """
     unet = UNet(
         audio_channels=2,
         labels=NUM_CLASSES,
         head_dim=13,
         ear_dim=24,
-        base_channels=16,
+        base_channels=BASE_CHANNELS,
     ).to(device)
     n_params = sum(p.numel() for p in unet.parameters())
-    print(f"  UNet parameters: {n_params:,}")
-    # torch.compile fuses kernels — ~20-30% speedup. First epoch is slower
-    # (compilation overhead) but all subsequent epochs benefit.
-    # Paper does not specify; neutral change.
+    print(f"  UNet parameters: {n_params:,}  |  base_channels={BASE_CHANNELS}")
     if hasattr(torch, 'compile'):
         unet = torch.compile(unet)
     return unet
@@ -213,8 +219,8 @@ def train_fold(fold_idx, split):
         milestones=[args.lr_warmup_epochs],
     )
 
-    # GradScaler for mixed precision — prevents FP16 underflow during backward
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == 'cuda')
+    # GradScaler: disabled for FP32 (large model), conservative for FP16
+    scaler = torch.cuda.amp.GradScaler(init_scale=1024, enabled=(device.type == 'cuda' and USE_FP16))
 
     best_val_loss    = float('inf')
     early_stop_count = 0
@@ -238,7 +244,7 @@ def train_fold(fold_idx, split):
             batch_noisy, noise = diffusion_model.forward(batch, t, device)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, dtype=torch.float16):
+            with torch.autocast(device_type=device.type, dtype=PRECISION_DTYPE, enabled=USE_FP16):
                 predicted_noise = unet(
                     batch_noisy.float(), t,
                     labels=label, head_embedding=head, ears_embedding=ears,
@@ -246,10 +252,14 @@ def train_fold(fold_idx, split):
                 loss = torch.nn.functional.l1_loss(noise, predicted_noise)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
+            torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=0.5)
+            # Skip step if gradients contain NaN (can happen early with large models)
+            if not any(torch.isnan(p.grad).any()
+                       for p in unet.parameters() if p.grad is not None):
+                scaler.step(optimizer)
             scaler.update()
-            train_losses.append(loss.item())
+            if not torch.isnan(loss):
+                train_losses.append(loss.item())
 
         scheduler.step()
 
@@ -267,7 +277,7 @@ def train_fold(fold_idx, split):
                 t = torch.randint(0, diffusion_model.timesteps,
                                   (batch.shape[0],), device=device).long()
                 batch_noisy, noise = diffusion_model.forward(batch, t, device)
-                with torch.autocast(device_type=device.type, dtype=torch.float16):
+                with torch.autocast(device_type=device.type, dtype=PRECISION_DTYPE, enabled=USE_FP16):
                     pred = unet(
                         batch_noisy.float(), t,
                         labels=label, head_embedding=head, ears_embedding=ears,
@@ -296,8 +306,10 @@ def train_fold(fold_idx, split):
 
         # ── Noise-distribution plot → TensorBoard + disk (every 50 epochs) ───
         if epoch % 50 == 0 and last_noise is not None:
-            plot_path = os.path.join(plots_fold_dir, f'noise_ep{epoch:04d}.png')
-            plot_noise_distribution(last_noise, last_pred, epoch, plot_path=plot_path)
+            # Guard against NaN predictions crashing the histogram
+            if not torch.isnan(last_pred).any():
+                plot_path = os.path.join(plots_fold_dir, f'noise_ep{epoch:04d}.png')
+                plot_noise_distribution(last_noise, last_pred, epoch, plot_path=plot_path)
             # Load saved PNG and push to TensorBoard as an image
             import torchvision.transforms.functional as tvf
             from PIL import Image
@@ -644,11 +656,16 @@ else:
                 'mean_nmse':   float(np.mean(all_nmse_vals)),
             }
         )
+        # Per-subject metrics (one row per subject)
         pd.DataFrame({
-            'lsd_L':  all_lsd_L,
-            'lsd_R':  all_lsd_R,
-            'lsd_avg':all_lsd_avg,
-            'itd':    all_itd_vals,
-            'pbc':    all_pbc_vals,
-            'nmse':   all_nmse_vals,
-        }).to_excel(os.path.join(RES_DIR, 'metrics_summary.xlsx'), index=False)
+            'lsd_L':   all_lsd_L,
+            'lsd_R':   all_lsd_R,
+            'lsd_avg': all_lsd_avg,
+            'itd':     all_itd_vals,
+            'pbc':     all_pbc_vals,
+        }).to_excel(os.path.join(RES_DIR, 'metrics_per_subject.xlsx'), index=False)
+
+        # Per-position NMSE (one row per position across all subjects)
+        pd.DataFrame({
+            'nmse': all_nmse_vals,
+        }).to_excel(os.path.join(RES_DIR, 'nmse_per_position.xlsx'), index=False)
