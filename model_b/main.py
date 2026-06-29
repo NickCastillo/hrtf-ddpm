@@ -125,7 +125,7 @@ NUM_CLASSES = 440
 # ── Precision selection ───────────────────────────────────────────────────────
 # base_channels=16 → (64,128,256,512,1024): large model prone to FP16 overflow.
 # All other base_channels use FP16 autocast for speed.
-BASE_CHANNELS = 16
+BASE_CHANNELS = 8
 USE_FP16 = (BASE_CHANNELS != 16)
 PRECISION_DTYPE = torch.float16 if USE_FP16 else torch.float32
 print(f"Precision: {'FP16 (autocast)' if USE_FP16 else 'FP32 (large model — NaN-safe)'}")
