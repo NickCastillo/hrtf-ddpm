@@ -48,6 +48,17 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
 # ── Inject model_b source dir so we reuse its model, dataset, utils ───────────
+def str2bool(v):
+    """Allow --flag true/false, yes/no, 1/0, t/f on the command line."""
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got '{v}'.")
+
+
 parser = argparse.ArgumentParser(description='HRTF DDPM — LOOCV training & inference')
 parser.add_argument('--src_dir', type=str,
                     default='/content/hrtf-ddpm/model_b',
@@ -74,6 +85,11 @@ parser.add_argument('--hrtf_directory', type=str,
                     default='/nas/home/jalbarracin/datasets/HUTUBS/HRIRs')
 parser.add_argument('--anthro_csv_path', type=str,
                     default='/nas/home/jalbarracin/datasets/HUTUBS/AntrhopometricMeasures.csv')
+parser.add_argument('--data_augmentation', type=str2bool, default=False,
+                    help='true/false — enable L/R mirroring augmentation (see dataset.py). '
+                         'Mirrored samples are only ever used for the training subjects; '
+                         'the val_fixed set and the LOOCV test subject always use real '
+                         'measurements only.')
 parser.add_argument('--verbose', action='store_true')
 parser.add_argument('--resume', action='store_true',
                     help='Resume training from existing checkpoint for each subject')
@@ -105,9 +121,11 @@ print("Loading dataset...")
 hutubs_dataset = HUTUBSDataset(
     hrtf_directory=args.hrtf_directory,
     anthro_csv_path=args.anthro_csv_path,
+    data_augmentation=args.data_augmentation,
 )
 all_subjects = hutubs_dataset.valid_subject_indices   # list of valid 1-based IDs
-print(f"Dataset size: {len(hutubs_dataset)} samples across {len(all_subjects)} subjects")
+print(f"Dataset size: {len(hutubs_dataset)} samples across {len(all_subjects)} subjects "
+      f"(data_augmentation={args.data_augmentation})")
 
 # ── LOOCV subject list ────────────────────────────────────────────────────────
 if args.loocv_subjects is not None:
@@ -140,16 +158,34 @@ if not os.path.exists(val_meta_path):
             'val_subjects':  sorted(val_fixed),
             'test_subjects': sorted(test_subjects),
             'all_subjects':  sorted(all_subjects),
+            'data_augmentation': args.data_augmentation,
         }, f, indent=2)
+else:
+    with open(val_meta_path) as f:
+        _prev_meta = json.load(f)
+    if _prev_meta.get('data_augmentation') != args.data_augmentation:
+        print(f"  WARNING: existing loocv_meta.json was created with "
+              f"data_augmentation={_prev_meta.get('data_augmentation')}, but this run uses "
+              f"data_augmentation={args.data_augmentation}. The val/test subject split itself "
+              f"is unaffected (it's subject-level and seeded independently of augmentation), "
+              f"but per-round checkpoints trained under the old setting are not directly "
+              f"comparable to ones trained under the new setting.")
 
 # ── Subject → dataset-index lookup ───────────────────────────────────────────
+# Split real vs. mirrored (augmented) indices per subject so val/test can be
+# restricted to real measurements only, even when data_augmentation=True.
 subj_to_indices = {}
+subj_to_real_indices = {}
 for i, item in enumerate(hutubs_dataset.normalized_dataset):
-    subj_to_indices.setdefault(item['subject_id'], []).append(i)
+    sid = item['subject_id']
+    subj_to_indices.setdefault(sid, []).append(i)
+    if not item['is_augmented']:
+        subj_to_real_indices.setdefault(sid, []).append(i)
 
 subj_point_index = {
     (item['subject_id'], item['measurement_point']): i
     for i, item in enumerate(hutubs_dataset.normalized_dataset)
+    if not item['is_augmented']   # inference/eval must reference real samples only
 }
 
 # ── Model constants ───────────────────────────────────────────────────────────
@@ -181,17 +217,22 @@ def get_split_indices(test_subject_id):
     For a given test subject, return train/val/test dataset indices.
     Val set is always val_fixed (same across rounds).
     Train = all subjects except test and val.
+
+    Mirrored (augmented) samples — present only when --data_augmentation
+    is enabled — are included for train subjects but deliberately excluded
+    from the val and test subject's indices, so early stopping and the
+    LOOCV test metric are always computed on real measurements only.
     """
     val_set  = set(val_fixed)
     test_set = {test_subject_id}
     train_indices, val_indices, test_indices = [], [], []
     for sid, indices in subj_to_indices.items():
         if sid in test_set:
-            test_indices.extend(indices)
+            test_indices.extend(subj_to_real_indices.get(sid, []))
         elif sid in val_set:
-            val_indices.extend(indices)
+            val_indices.extend(subj_to_real_indices.get(sid, []))
         else:
-            train_indices.extend(indices)
+            train_indices.extend(indices)   # real + mirrored for train subjects
     return train_indices, val_indices, test_indices
 
 
