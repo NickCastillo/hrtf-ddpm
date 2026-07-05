@@ -89,6 +89,14 @@ class Block(nn.Module):
     Normalisation: paper states BatchNorm. We use GroupNorm (improvement)
     because BatchNorm degrades at small spatial lengths in deep encoder
     levels (L=8 at the bottleneck), and paper does not justify the choice.
+
+    Conditioning fusion: paper Sec. III-C concatenates the conditioning
+    embeddings with the feature map (channel-wise) rather than adding them.
+    Each conditioning signal (time, DOA label, head, ear) is projected to
+    channels_out, broadcast across the sequence length, concatenated with
+    the post-conv1 feature map along the channel dimension, and fused back
+    down to channels_out via a 1x1 conv. This replaces the previous
+    addition-based injection (discrepancy #8 vs. the paper).
     """
     def __init__(self, channels_in, channels_out, time_embedding_dims,
                  labels, head_dim, ear_dim,
@@ -98,7 +106,7 @@ class Block(nn.Module):
         self.time_embedding = SinusoidalPositionEmbeddings(time_embedding_dims)
         self.downsample     = downsample
 
-        # ── Conditioning projections (FC layers added to feature maps, Sec.III-C) ─
+        # ── Conditioning projections (FC layers concatenated to feature maps, Sec.III-C) ─
         self.time_mlp = nn.Linear(time_embedding_dims, channels_out)
 
         if labels:
@@ -126,6 +134,12 @@ class Block(nn.Module):
         self.conv1 = nn.Conv1d(in_ch,          channels_out, 3, padding=1)
         self.conv2 = nn.Conv1d(channels_out,   channels_out, 3, padding=1)
 
+        # ── Conditioning fusion (concatenation, not addition) ─────────────────
+        # Tensors concatenated along the channel dim: the feature map itself,
+        # plus time (always active), plus label/head/ear if active.
+        n_concat_tensors = 2 + int(bool(labels)) + int(bool(head_dim)) + int(bool(ear_dim))
+        self.cond_fuse = nn.Conv1d(channels_out * n_concat_tensors, channels_out, kernel_size=1)
+
         # GroupNorm (improvement over paper's BatchNorm — see docstring)
         ng = min(8, channels_out)
         self.gn1 = nn.GroupNorm(ng, channels_out)
@@ -147,18 +161,30 @@ class Block(nn.Module):
     def forward(self, x, t, **kwargs):
         # (i) conv → GroupNorm → ReLU
         o = self.relu(self.gn1(self.conv1(x)))
+        L = o.shape[-1]
 
-        # Inject conditioning — each projected to channels_out, added spatially
-        o = o + self.relu(self.time_mlp(self.time_embedding(t))).unsqueeze(2)
+        # Project every active conditioning signal to channels_out and
+        # broadcast across the sequence length, then concatenate with o
+        # along the channel dimension (paper: concatenation, not addition).
+        cond_feats = [o]
+
+        time_feat = self.relu(self.time_mlp(self.time_embedding(t)))       # (B, channels_out)
+        cond_feats.append(time_feat.unsqueeze(2).expand(-1, -1, L))
 
         if self.head_dim:
-            o = o + self.head_fc(kwargs['head_embedding'].float()).unsqueeze(2)
+            head_feat = self.head_fc(kwargs['head_embedding'].float())      # (B, channels_out)
+            cond_feats.append(head_feat.unsqueeze(2).expand(-1, -1, L))
 
         if self.ear_dim:
-            o = o + self.ear_fc(kwargs['ears_embedding'].float()).unsqueeze(2)
+            ear_feat = self.ear_fc(kwargs['ears_embedding'].float())        # (B, channels_out)
+            cond_feats.append(ear_feat.unsqueeze(2).expand(-1, -1, L))
 
         if self.labels:
-            o = o + self.label_emb(kwargs['labels']).squeeze(1).unsqueeze(2)
+            label_feat = self.label_emb(kwargs['labels']).view(o.shape[0], -1)  # (B, channels_out)
+            cond_feats.append(label_feat.unsqueeze(2).expand(-1, -1, L))
+
+        o = torch.cat(cond_feats, dim=1)     # (B, channels_out * n_cond, L)
+        o = self.cond_fuse(o)                # fuse back down to channels_out
 
         # (ii) conv → GroupNorm  (no activation — paper)
         o = self.gn2(self.conv2(o))
@@ -177,7 +203,8 @@ class UNet(nn.Module):
       - 5 decoder blocks mirroring the encoder
       - Self-attention with 4 heads after every downsampling block
       - Skip connections via concatenation
-      - Conditioning injected at every block via FC layers
+      - Conditioning injected at every block via FC layers, fused by
+        channel-wise concatenation (paper), not addition
 
     base_channels: scalar multiplier. Paper states (4,8,16,32,64); since those
     are very narrow for a 2-channel 256-sample signal we expose this as a

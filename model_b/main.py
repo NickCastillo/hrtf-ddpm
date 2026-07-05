@@ -23,6 +23,17 @@ print(f"Using device: {device}")
 # TF32 on Ampere GPUs — free ~5-10% speedup, no effect on model behaviour
 torch.set_float32_matmul_precision('high')
 
+def str2bool(v):
+    """Allow --flag true/false, yes/no, 1/0, t/f on the command line."""
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got '{v}'.")
+
+
 # ── Arguments ─────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description='HRTF DDPM — per-fold training & inference')
 parser.add_argument('--mode', type=str, choices=['train', 'infer'], required=True,
@@ -59,6 +70,12 @@ parser.add_argument('--hrtf_directory', type=str,
                     default='/nas/home/jalbarracin/datasets/HUTUBS/HRIRs')
 parser.add_argument('--anthro_csv_path', type=str,
                     default='/nas/home/jalbarracin/datasets/HUTUBS/AntrhopometricMeasures.csv')
+parser.add_argument('--data_augmentation', type=str2bool, default=False,
+                    help='true/false — enable L/R mirroring augmentation. Swaps L/R HRIR '
+                         'channels, re-labels the measurement point via its mirrored '
+                         'source position, and swaps L/R ear measurements, roughly '
+                         'doubling the training set per subject. Only affects the '
+                         'training split; validation/test always use real measurements.')
 parser.add_argument('--verbose', action='store_true')
 args = parser.parse_args()
 
@@ -92,14 +109,35 @@ print("Loading dataset...")
 hutubs_dataset = HUTUBSDataset(
     hrtf_directory=args.hrtf_directory,
     anthro_csv_path=args.anthro_csv_path,
+    data_augmentation=args.data_augmentation,
 )
-print(f"Dataset size: {len(hutubs_dataset)} samples")
+print(f"Dataset size: {len(hutubs_dataset)} samples "
+      f"(data_augmentation={args.data_augmentation})")
 
-if os.path.exists(SPLITS_PATH):
-    with open(SPLITS_PATH) as f:
-        splits = json.load(f)
-    print(f"Loaded existing splits from {SPLITS_PATH}")
-else:
+# splits_meta.json travels alongside splits.json and records whether the
+# cached splits were built with augmentation on or off. Since enabling/
+# disabling --data_augmentation changes which indices belong to the dataset
+# (mirrored samples are appended after the real ones), a splits.json cached
+# under a different augmentation setting must be regenerated rather than
+# reused verbatim — otherwise mirrored train samples would silently be
+# missing (or, if the flag went off after being on, indices could point at
+# entries that no longer exist).
+SPLITS_META_PATH = os.path.join(CKPT_DIR, 'splits_meta.json')
+
+
+def _splits_need_regen():
+    if not os.path.exists(SPLITS_PATH):
+        return True
+    if not os.path.exists(SPLITS_META_PATH):
+        # Older cache with no recorded provenance — regenerate to be safe.
+        return True
+    with open(SPLITS_META_PATH) as f:
+        meta = json.load(f)
+    return (meta.get('data_augmentation') != args.data_augmentation
+            or meta.get('k_folds') != args.k_folds)
+
+
+if _splits_need_regen():
     splits = hutubs_dataset.get_kfold_splits(k=args.k_folds)
     splits_serialisable = [
         {k: [int(x) for x in v] for k, v in s.items()}
@@ -107,7 +145,13 @@ else:
     ]
     with open(SPLITS_PATH, 'w') as f:
         json.dump(splits_serialisable, f, indent=2)
-    print(f"Saved splits to {SPLITS_PATH}")
+    with open(SPLITS_META_PATH, 'w') as f:
+        json.dump({'data_augmentation': args.data_augmentation, 'k_folds': args.k_folds}, f)
+    print(f"Saved splits to {SPLITS_PATH} (data_augmentation={args.data_augmentation})")
+else:
+    with open(SPLITS_PATH) as f:
+        splits = json.load(f)
+    print(f"Loaded existing splits from {SPLITS_PATH} (data_augmentation={args.data_augmentation})")
 
 # Resolve folds to run
 if args.fold is not None:
