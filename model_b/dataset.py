@@ -130,6 +130,19 @@ class HUTUBSDataset(Dataset):
         head_meas_raw = torch.from_numpy(af_csv.iloc[:, 1:14].values.astype(np.float32))
         ear_meas_raw = torch.from_numpy(af_csv.iloc[:, 14:].values.astype(np.float32))
 
+        # Drop excluded subjects' rows (e.g. 18/79/92 — present in the CSV
+        # but fully NaN) *before* any imputation or normalization statistics
+        # are computed.
+        valid_mask = np.isin(subject_ids_csv, valid_subject_indices)
+        n_dropped = int((~valid_mask).sum())
+        if n_dropped:
+            print(f"[anthro] Dropping {n_dropped} excluded-subject row(s) from anthro CSV "
+                  f"before computing normalization statistics: "
+                  f"{sorted(subject_ids_csv[~valid_mask].tolist())}")
+        subject_ids_csv = subject_ids_csv[valid_mask]
+        head_meas_raw   = head_meas_raw[torch.from_numpy(valid_mask)]
+        ear_meas_raw    = ear_meas_raw[torch.from_numpy(valid_mask)]
+
         # Replace NaN with column mean before normalization
         for col in range(head_meas_raw.shape[1]):
             col_mean = head_meas_raw[:, col][~torch.isnan(head_meas_raw[:, col])].mean()
