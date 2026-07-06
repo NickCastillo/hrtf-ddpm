@@ -44,39 +44,12 @@ point / direction-of-arrival, and anthropometric head + ear features.
 | Evaluation protocol      | random 80/20 **sample-level** split (leaks test subjects into training) | **subject-level** k-fold CV, no leakage             | This is possibly the primary source of the ~7.6 dB (ours) vs. 5.1 dB (paper) LSD gap. k-fold was chosen to speed up training, the source code also includes a leaky protocol which has now been fixed. |
 | Anthropometric features  | count/selection unclear                                                 | head_dim=13, ear_dim=24 (sigmoid-normalized, Eq. 4) | Pending clarification from paper's authors. At the moment all HUTUBS features are used.                                                                                                                |
 
-## Data augmentation — L/R mirroring (new)
-
-**Flag:** `--data_augmentation true/false` (default `false`)
-
-Exploits approximate left/right symmetry of the head to synthesize an
-extra sample from every real one:
-
-1. Swap the L/R HRIR channels.
-2. Re-label the measurement point as its **mirrored** source position
-   (azimuth → `(360 − azimuth) % 360`; elevation/radius unchanged).
-3. Swap the L/R halves of the ear measurements (head measurements are
-   left unchanged — assumed non-lateralized).
-
-This roughly doubles the number of training samples per subject.
-
-**Important:** mirrored samples are only ever placed in the **training**
-split — `get_kfold_splits` guarantees validation and test always contain
-real, physically measured samples only.
-
-**Assumptions to verify before trusting results:**
-
-- SOFA `SourcePosition` columns are `(azimuth, elevation, radius)` under
-  the mirroring convention above (a warning is printed if the grid
-  doesn't check out as symmetric).
-- The anthropometric CSV's ear-measurement columns are laid out as
-  `[left-ear features][right-ear features]` in two equal halves.
-
 ## Other notes
 
 - **Splits caching:** `checkpoint_dir/splits.json` + `splits_meta.json`.
-  The metadata file records the `data_augmentation` / `k_folds` setting
-  used to build the cached splits and forces a regeneration if either
-  changes, so stale index caches can't silently be reused.
+  The metadata file records the `k_folds` setting used to build the
+  cached splits and forces a regeneration if it changes, so stale index
+  caches can't silently be reused.
 - **Precision:** FP16 autocast by default; falls back to FP32 for
   `base_channels=16` (large model) to avoid overflow.
 - **Metrics:** LSD (L/R + avg, Eq. 9), ITD error (energy-onset
@@ -90,6 +63,6 @@ real, physically measured samples only.
 | File         | Contents                                                                 |
 | ------------ | ------------------------------------------------------------------------ |
 | `model.py`   | `DiffusionModel` (noise schedule), `UNet` architecture                   |
-| `dataset.py` | `HUTUBSDataset` — loading, normalization, k-fold splitting, augmentation |
+| `dataset.py` | `HUTUBSDataset` — loading, normalization, k-fold splitting             |
 | `main.py`    | CLI entrypoint — training & inference per fold                           |
 | `utils.py`   | Metrics (LSD, ITD, PBC, NMSE) and plotting                               |

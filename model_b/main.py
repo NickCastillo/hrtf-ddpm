@@ -70,12 +70,6 @@ parser.add_argument('--hrtf_directory', type=str,
                     default='/nas/home/jalbarracin/datasets/HUTUBS/HRIRs')
 parser.add_argument('--anthro_csv_path', type=str,
                     default='/nas/home/jalbarracin/datasets/HUTUBS/AntrhopometricMeasures.csv')
-parser.add_argument('--data_augmentation', type=str2bool, default=False,
-                    help='true/false — enable L/R mirroring augmentation. Swaps L/R HRIR '
-                         'channels, re-labels the measurement point via its mirrored '
-                         'source position, and swaps L/R ear measurements, roughly '
-                         'doubling the training set per subject. Only affects the '
-                         'training split; validation/test always use real measurements.')
 parser.add_argument('--verbose', action='store_true')
 args = parser.parse_args()
 
@@ -109,19 +103,12 @@ print("Loading dataset...")
 hutubs_dataset = HUTUBSDataset(
     hrtf_directory=args.hrtf_directory,
     anthro_csv_path=args.anthro_csv_path,
-    data_augmentation=args.data_augmentation,
 )
-print(f"Dataset size: {len(hutubs_dataset)} samples "
-      f"(data_augmentation={args.data_augmentation})")
+print(f"Dataset size: {len(hutubs_dataset)} samples")
 
-# splits_meta.json travels alongside splits.json and records whether the
-# cached splits were built with augmentation on or off. Since enabling/
-# disabling --data_augmentation changes which indices belong to the dataset
-# (mirrored samples are appended after the real ones), a splits.json cached
-# under a different augmentation setting must be regenerated rather than
-# reused verbatim — otherwise mirrored train samples would silently be
-# missing (or, if the flag went off after being on, indices could point at
-# entries that no longer exist).
+# splits_meta.json travels alongside splits.json and records the k_folds
+# setting used to build the cached splits, so a cache built with a
+# different fold count is regenerated rather than reused verbatim.
 SPLITS_META_PATH = os.path.join(CKPT_DIR, 'splits_meta.json')
 
 
@@ -133,8 +120,7 @@ def _splits_need_regen():
         return True
     with open(SPLITS_META_PATH) as f:
         meta = json.load(f)
-    return (meta.get('data_augmentation') != args.data_augmentation
-            or meta.get('k_folds') != args.k_folds)
+    return meta.get('k_folds') != args.k_folds
 
 
 if _splits_need_regen():
@@ -146,12 +132,12 @@ if _splits_need_regen():
     with open(SPLITS_PATH, 'w') as f:
         json.dump(splits_serialisable, f, indent=2)
     with open(SPLITS_META_PATH, 'w') as f:
-        json.dump({'data_augmentation': args.data_augmentation, 'k_folds': args.k_folds}, f)
-    print(f"Saved splits to {SPLITS_PATH} (data_augmentation={args.data_augmentation})")
+        json.dump({'k_folds': args.k_folds}, f)
+    print(f"Saved splits to {SPLITS_PATH}")
 else:
     with open(SPLITS_PATH) as f:
         splits = json.load(f)
-    print(f"Loaded existing splits from {SPLITS_PATH} (data_augmentation={args.data_augmentation})")
+    print(f"Loaded existing splits from {SPLITS_PATH}")
 
 # Resolve folds to run
 if args.fold is not None:
