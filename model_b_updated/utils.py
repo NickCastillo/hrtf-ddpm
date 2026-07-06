@@ -121,7 +121,8 @@ def _stack(hrirs):
     return np.stack([_to_np(h) for h in hrirs], axis=0).astype(np.float32)
 
 
-def combined_loss(noise, predicted_noise, freq_weight=0.3, sr=SR, k_bands=K_BANDS, f_max=F_MAX):
+def combined_loss(noise, predicted_noise, freq_weight=0.3, sr=SR, k_bands=K_BANDS,
+                   f_max=F_MAX, return_components=False):
     """
     Training loss combining the paper's time-domain term with a
     frequency-magnitude term.
@@ -134,23 +135,38 @@ def combined_loss(noise, predicted_noise, freq_weight=0.3, sr=SR, k_bands=K_BAND
       reduce error in the bands the reported metric actually measures,
       rather than only minimizing uniform time-domain error.
 
+    IMPORTANT — normalization: the FFT is computed with norm='ortho'.
+    An unnormalized FFT magnitude scales with sqrt(signal_length) relative
+    to the time-domain amplitude (e.g. ~16x for length-256 unit-variance
+    noise), which would make the frequency term dominate the sum almost
+    regardless of freq_weight, silently defeating the intended blend.
+    'ortho' normalization keeps both terms on comparable scale so
+    freq_weight actually controls the blend as documented.
+
     final_loss = (1 - freq_weight) * L1_time + freq_weight * L1_freq_mag
 
     noise, predicted_noise: (B, 2, L) tensors — ground-truth / predicted
     diffusion noise (epsilon), not the HRIR itself. FFT is computed in
     float32 regardless of the ambient autocast dtype for numerical safety.
+
+    If return_components=True, returns (loss, l1_time, l1_freq) so the
+    two terms can be logged separately (e.g. to TensorBoard) to verify
+    they stay on a comparable scale.
     """
     l1_time = F.l1_loss(noise, predicted_noise)
 
     band_idx = torch.as_tensor(_get_freq_bins(sr=sr), device=noise.device, dtype=torch.long)
 
-    noise_fft = torch.fft.rfft(noise.float(), dim=-1)
-    pred_fft  = torch.fft.rfft(predicted_noise.float(), dim=-1)
+    noise_fft = torch.fft.rfft(noise.float(), dim=-1, norm='ortho')
+    pred_fft  = torch.fft.rfft(predicted_noise.float(), dim=-1, norm='ortho')
     mag_noise = torch.abs(noise_fft).index_select(-1, band_idx)
     mag_pred  = torch.abs(pred_fft).index_select(-1, band_idx)
     l1_freq   = F.l1_loss(mag_noise, mag_pred)
 
-    return (1 - freq_weight) * l1_time + freq_weight * l1_freq
+    loss = (1 - freq_weight) * l1_time + freq_weight * l1_freq
+    if return_components:
+        return loss, l1_time.detach(), l1_freq.detach()
+    return loss
 
 
 def lsd(hrir_test, hrir_gen, points, sr=SR):

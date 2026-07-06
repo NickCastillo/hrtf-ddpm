@@ -75,6 +75,15 @@ Implemented as `combined_loss()` in `utils.py`, reusing the same
 frequency-bin selection (`_get_freq_bins`) as `lsd()` so the loss is
 aligned with what's actually being measured at evaluation time.
 
+**Bugfix (post-first-run):** the FFT is computed with `norm='ortho'`.
+An unnormalized FFT's magnitude scales with `sqrt(signal_length)`
+relative to the time-domain amplitude (~16x for length-256 unit-variance
+noise), so without this the frequency term dominated the sum almost
+regardless of `loss_freq_weight`, silently turning a 70/30 blend into
+something closer to 15/85 and degrading results. `Loss/train_l1_time`
+and `Loss/train_l1_freq` are now logged separately to TensorBoard so
+this kind of scale mismatch is visible going forward.
+
 ## Other notes
 
 - **Splits caching:** `checkpoint_dir/splits.json` + `splits_meta.json`.

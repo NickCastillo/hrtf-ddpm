@@ -280,6 +280,8 @@ def train_fold(fold_idx, split):
         # ── Train ─────────────────────────────────────────────────────────────
         unet.train()
         train_losses = []
+        train_l1_time = []
+        train_l1_freq = []
         for data in train_loader:
             batch = data['hrtf'].to(device, non_blocking=True).float()
             label = data['measurement_point'].to(device, non_blocking=True)
@@ -296,7 +298,10 @@ def train_fold(fold_idx, split):
                     batch_noisy.float(), t,
                     labels=label, head_embedding=head, ears_embedding=ears,
                 )
-                loss = combined_loss(noise, predicted_noise, freq_weight=args.loss_freq_weight)
+                loss, l1_time_c, l1_freq_c = combined_loss(
+                    noise, predicted_noise, freq_weight=args.loss_freq_weight,
+                    return_components=True,
+                )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=0.5)
@@ -310,6 +315,8 @@ def train_fold(fold_idx, split):
                 ema.update(unet)
             if not torch.isnan(loss):
                 train_losses.append(loss.item())
+                train_l1_time.append(l1_time_c.item())
+                train_l1_freq.append(l1_freq_c.item())
 
         scheduler.step()
 
@@ -346,6 +353,8 @@ def train_fold(fold_idx, split):
         # ── TensorBoard scalars ───────────────────────────────────────────────
         writer.add_scalar('Loss/train',      mean_train, epoch)
         writer.add_scalar('Loss/val',        mean_val,   epoch)
+        writer.add_scalar('Loss/train_l1_time', np.mean(train_l1_time), epoch)
+        writer.add_scalar('Loss/train_l1_freq', np.mean(train_l1_freq), epoch)
         writer.add_scalar('LR/learning_rate', current_lr, epoch)
         writer.add_scalar('EarlyStopping/patience_counter', early_stop_count, epoch)
 
