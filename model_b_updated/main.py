@@ -43,19 +43,24 @@ parser.add_argument('--fold', type=int, default=None,
 parser.add_argument('--BATCH_SIZE', type=int, default=128)
 parser.add_argument('--epochs', type=int, default=1000)
 # ── LR & Scheduler ────────────────────────────────────────────────────────────
-# StepLR (paper: lr=1e-3, 20% decay every 100 epochs) is preferred over
-# CosineAnnealing because:
-#   1. StepLR is monotonically decreasing — early stopping always saves the
-#      checkpoint at the model's most fine-grained convergence point.
-#      CosineAnnealing oscillates; with early stopping the saved checkpoint
-#      can land at any arbitrary point in the cosine cycle.
-#   2. Cosine restarts help escape local minima over long budgets; with
-#      ~1000 epochs and early stopping at ~400-600, they add noise not value.
+# ReduceLROnPlateau: start at --lr, halve whenever val loss hasn't improved
+# for --lr_plateau_patience epochs, down to --lr_min. Preferred over a fixed
+# StepLR because it reacts to when the model actually stalls rather than
+# decaying on a rigid calendar — with early stopping at min_epoch=100,
+# patience=200, this gives the LR several chances to drop and refine the
+# solution before training actually stops. Still monotonically
+# non-increasing, so early stopping still always saves the checkpoint at
+# the model's most fine-grained convergence point (same rationale that
+# ruled out CosineAnnealing before).
 # A 10-epoch linear warmup is prepended to stabilise attention layers at init.
 parser.add_argument('--lr', type=float, default=1e-3)
 parser.add_argument('--lr_warmup_epochs', type=int, default=10)
-parser.add_argument('--lr_step', type=int, default=100)
-parser.add_argument('--lr_gamma', type=float, default=0.8)
+parser.add_argument('--lr_plateau_patience', type=int, default=25,
+                    help='Epochs with no val-loss improvement before halving the LR.')
+parser.add_argument('--lr_plateau_factor', type=float, default=0.5,
+                    help='Multiplicative LR reduction factor on plateau.')
+parser.add_argument('--lr_min', type=float, default=1e-6,
+                    help='Floor for the LR — plateau reductions stop here.')
 parser.add_argument('--early_stop_patience', type=int, default=200)
 parser.add_argument('--early_stop_min_epoch', type=int, default=100)
 # ── EMA ───────────────────────────────────────────────────────────────────────
@@ -225,8 +230,9 @@ def train_fold(fold_idx, split):
         hparam_dict={
             'lr': args.lr,
             'lr_warmup_epochs': args.lr_warmup_epochs,
-            'lr_step': args.lr_step,
-            'lr_gamma': args.lr_gamma,
+            'lr_plateau_patience': args.lr_plateau_patience,
+            'lr_plateau_factor': args.lr_plateau_factor,
+            'lr_min': args.lr_min,
             'batch_size': args.BATCH_SIZE,
             'early_stop_patience': args.early_stop_patience,
             'ema_decay': args.ema_decay,
@@ -253,17 +259,20 @@ def train_fold(fold_idx, split):
     optimizer = torch.optim.Adam(unet.parameters(), lr=args.lr)
     ema = EMA(unet, decay=args.ema_decay)
 
+    # Warmup and plateau scheduling are applied manually (not via SequentialLR)
+    # because ReduceLROnPlateau requires a metric at step() time and isn't a
+    # standard chainable _LRScheduler. During the first lr_warmup_epochs we
+    # step warmup_scheduler; after that we step plateau_scheduler with the
+    # epoch's validation loss.
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0,
         total_iters=args.lr_warmup_epochs,
     )
-    step_scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=args.lr_step, gamma=args.lr_gamma,
-    )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, step_scheduler],
-        milestones=[args.lr_warmup_epochs],
+    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min',
+        factor=args.lr_plateau_factor,
+        patience=args.lr_plateau_patience,
+        min_lr=args.lr_min,
     )
 
     # GradScaler: disabled for FP32 (large model), conservative for FP16
@@ -318,8 +327,6 @@ def train_fold(fold_idx, split):
                 train_l1_time.append(l1_time_c.item())
                 train_l1_freq.append(l1_freq_c.item())
 
-        scheduler.step()
-
         # ── Validate (using EMA weights — swapped in for the duration) ──────────
         ema.apply_shadow(unet)
         unet.eval()
@@ -348,7 +355,14 @@ def train_fold(fold_idx, split):
 
         mean_train = np.mean(train_losses)
         mean_val   = np.mean(val_losses)
-        current_lr = scheduler.get_last_lr()[0]
+
+        # Warmup for the first lr_warmup_epochs, then hand off to the
+        # validation-driven plateau scheduler.
+        if epoch < args.lr_warmup_epochs:
+            warmup_scheduler.step()
+        else:
+            plateau_scheduler.step(mean_val)
+        current_lr = optimizer.param_groups[0]['lr']
 
         # ── TensorBoard scalars ───────────────────────────────────────────────
         writer.add_scalar('Loss/train',      mean_train, epoch)
@@ -390,7 +404,8 @@ def train_fold(fold_idx, split):
                 'model_state_dict': unet.state_dict(),
                 'ema_state_dict':   ema.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
+                'warmup_scheduler_state_dict': warmup_scheduler.state_dict(),
+                'plateau_scheduler_state_dict': plateau_scheduler.state_dict(),
                 'val_loss':   torch.tensor(best_val_loss),
                 'fold':       torch.tensor(fold_idx + 1),
             }, model_path)
@@ -410,7 +425,9 @@ def train_fold(fold_idx, split):
     writer.add_hparams(
         hparam_dict={
             'lr': args.lr, 'lr_warmup_epochs': args.lr_warmup_epochs,
-            'lr_step': args.lr_step, 'lr_gamma': args.lr_gamma,
+            'lr_plateau_patience': args.lr_plateau_patience,
+            'lr_plateau_factor': args.lr_plateau_factor,
+            'lr_min': args.lr_min,
             'batch_size': args.BATCH_SIZE,
             'early_stop_patience': args.early_stop_patience,
             'ema_decay': args.ema_decay,
