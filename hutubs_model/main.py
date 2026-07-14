@@ -110,9 +110,9 @@ parser.add_argument('--runs_dir', type=str, default=None,
                          'Defaults to ./runs/<model_name>.')
 parser.add_argument('--k_folds', type=int, default=5)
 parser.add_argument('--hrtf_directory', type=str,
-                    default='/nas/home/jalbarracin/datasets/HUTUBS/HRIRs')
+                    default='./HUTUBS/HRIRs')
 parser.add_argument('--anthro_csv_path', type=str,
-                    default='/nas/home/jalbarracin/datasets/HUTUBS/AnthropometricMeasures.csv')
+                    default='./HUTUBS/AntrhopometricMeasures.csv')
 parser.add_argument('--verbose', action='store_true')
 args = parser.parse_args()
 
@@ -785,20 +785,24 @@ if args.mode == 'train':
 else:
     subj_point_index = build_subject_point_index(hutubs_dataset)
 
+    for fi in fold_indices:
+        infer_fold(fi, splits[fi], subj_point_index)
+
     all_subject_ids, all_lsd_L, all_lsd_R, all_lsd_avg = [], [], [], []
     all_itd_vals, all_pbc_vals, all_nmse_vals, all_nmse_subj = [], [], [], []
-    for fi in fold_indices:
-        fs_ids, fl_L, fl_R, fl_avg, fi_itd, fi_pbc, fn, fn_subj = infer_fold(
-            fi, splits[fi], subj_point_index
-        )
-        all_subject_ids.extend(fs_ids)
-        all_lsd_L.extend(fl_L)
-        all_lsd_R.extend(fl_R)
-        all_lsd_avg.extend(fl_avg)
-        all_itd_vals.extend(fi_itd)
-        all_pbc_vals.extend(fi_pbc)
-        all_nmse_vals.extend(fn)
-        all_nmse_subj.extend(fn_subj)
+    for fi in range(len(splits)):
+        summary_path = os.path.join(MAT_DIR, f'fold_{fi + 1}_summary.mat')
+        if not os.path.exists(summary_path):
+            continue   # this fold has never completed inference — skip it
+        m = sio.loadmat(summary_path)
+        all_subject_ids.extend(m['subject_id_per_subject'].ravel().tolist())
+        all_lsd_L.extend(m['lsd_L_per_subject'].ravel().tolist())
+        all_lsd_R.extend(m['lsd_R_per_subject'].ravel().tolist())
+        all_lsd_avg.extend(m['lsd_avg_per_subject'].ravel().tolist())
+        all_itd_vals.extend(m['itd_per_subject'].ravel().tolist())
+        all_pbc_vals.extend(m['pbc_per_subject'].ravel().tolist())
+        all_nmse_subj.extend(m['nmse_per_subject'].ravel().tolist())
+        all_nmse_vals.extend(m['nmse_per_position'].ravel().tolist())
 
     if all_lsd_avg:
         print(f"\nOverall LSD_L  : {np.mean(all_lsd_L):.3f} ± {np.std(all_lsd_L):.3f} dB")
