@@ -77,20 +77,61 @@ parser.add_argument('--loss_freq_weight', type=float, default=0.3,
                     help='Weight on the frequency-magnitude term of the combined '
                          'loss: final = (1 - w) * L1_time + w * L1_freq_mag. '
                          'w=0 recovers the plain time-domain L1 loss.')
-# ── Paths ─────────────────────────────────────────────────────────────────────
-parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
-                    help='Where to save model weights and splits.json')
-parser.add_argument('--results_dir', type=str, default='./results',
-                    help='Where to save .mat files, plots, and .wav files')
-parser.add_argument('--runs_dir', type=str, default='./runs',
-                    help='Where to save TensorBoard event files')
+# ── Architecture ablations ───────────────────────────────────────────────────
+parser.add_argument('--full_attention', type=str2bool, default=False,
+                    help='true/false — ablation switch. Default (false) restricts '
+                         'self-attention to the two deepest encoder blocks, per '
+                         'UNet\'s default attn_full_encoder=False. Set to true to '
+                         'enable attention on all 4 encoder blocks (matching the '
+                         'paper\'s "after every downsampling block"), for a '
+                         'controlled comparison of final per-subject LSD against '
+                         'the default placement. Use --model_name to tag this '
+                         'run\'s outputs distinctly from the baseline.')
+# ── Model identity / paths ───────────────────────────────────────────────────
+parser.add_argument('--model_name', type=str, default='HUTUBS_model',
+                    help='Tag for this model/run. Used to (a) namespace default '
+                         'output directories (./checkpoints|results|runs/<model_name>) '
+                         'and (b) label every exported per-subject metrics row '
+                         '(a \'model\' column), so results from different runs — '
+                         'e.g. this HUTUBS baseline vs. an attention-ablation run, '
+                         'or the later SONICOM ablation conditions — can be joined '
+                         'on \'subject_id\' and disambiguated by \'model\' for a '
+                         'paired Wilcoxon signed-rank test without ambiguity about '
+                         'provenance. Override e.g. --model_name HUTUBS_model_full_attn '
+                         'for the attention-placement ablation run.')
+parser.add_argument('--checkpoint_dir', type=str, default=None,
+                    help='Where to save model weights and splits.json. '
+                         'Defaults to ./checkpoints/<model_name>.')
+parser.add_argument('--results_dir', type=str, default=None,
+                    help='Where to save .mat files, plots, and .wav files. '
+                         'Defaults to ./results/<model_name>.')
+parser.add_argument('--runs_dir', type=str, default=None,
+                    help='Where to save TensorBoard event files. '
+                         'Defaults to ./runs/<model_name>.')
 parser.add_argument('--k_folds', type=int, default=5)
 parser.add_argument('--hrtf_directory', type=str,
                     default='/nas/home/jalbarracin/datasets/HUTUBS/HRIRs')
 parser.add_argument('--anthro_csv_path', type=str,
-                    default='/nas/home/jalbarracin/datasets/HUTUBS/AntrhopometricMeasures.csv')
+                    default='/nas/home/jalbarracin/datasets/HUTUBS/AnthropometricMeasures.csv')
 parser.add_argument('--verbose', action='store_true')
 args = parser.parse_args()
+
+# MODEL_NAME tags every exported output (see --model_name help above).
+# Kept as a module-level alias for readability at call sites below.
+MODEL_NAME = args.model_name
+
+# Namespace default output dirs under model_name unless explicitly overridden,
+# so e.g. `--model_name HUTUBS_model_full_attn` automatically writes to
+# ./checkpoints/HUTUBS_model_full_attn, ./results/HUTUBS_model_full_attn, etc.
+# without clobbering the baseline HUTUBS_model run's checkpoints/results.
+if args.checkpoint_dir is None:
+    args.checkpoint_dir = os.path.join('./checkpoints', args.model_name)
+if args.results_dir is None:
+    args.results_dir = os.path.join('./results', args.model_name)
+if args.runs_dir is None:
+    args.runs_dir = os.path.join('./runs', args.model_name)
+
+print(f"Model name: {MODEL_NAME}  |  full_attention={args.full_attention}")
 
 # ── Directory layout ──────────────────────────────────────────────────────────
 #
@@ -182,7 +223,8 @@ print(f"Precision: {'FP16 (autocast)' if USE_FP16 else 'FP32 (large model — Na
 
 def build_unet():
     """
-    Paper architecture: channel mults (4,8,16,32,64) x BASE_CHANNELS, 5 encoder blocks.
+    Paper architecture: channel mults (4,8,16,32,64) x BASE_CHANNELS, 4 encoder blocks
+    (see model.py's UNet docstring for why 5 channel levels give 4 blocks, not 5).
     BASE_CHANNELS=8  → (32,  64, 128, 256,  512) default
     BASE_CHANNELS=16 → (64, 128, 256, 512, 1024) large / paper channel sizes
     BASE_CHANNELS=1  → (4,    8,  16,  32,   64) literal paper (too narrow)
@@ -190,12 +232,14 @@ def build_unet():
     unet = UNet(
         audio_channels=2,
         labels=NUM_CLASSES,
-        head_dim=13,
+        head_dim=0,     # HUTUBS_model, Phase 0: head/torso features ignored
         ear_dim=24,
         base_channels=BASE_CHANNELS,
+        attn_full_encoder=args.full_attention,   # ablation switch — see --full_attention
     ).to(device)
     n_params = sum(p.numel() for p in unet.parameters())
-    print(f"  UNet parameters: {n_params:,}  |  base_channels={BASE_CHANNELS}")
+    print(f"  UNet parameters: {n_params:,}  |  base_channels={BASE_CHANNELS}  |  "
+          f"full_attention={args.full_attention}")
     if hasattr(torch, 'compile'):
         unet = torch.compile(unet)
     return unet
@@ -237,6 +281,8 @@ def train_fold(fold_idx, split):
             'early_stop_patience': args.early_stop_patience,
             'ema_decay': args.ema_decay,
             'loss_freq_weight': args.loss_freq_weight,
+            'full_attention': args.full_attention,
+            'model_name': args.model_name,
             'fold': fold_idx + 1,
         },
         metric_dict={'best_val_loss': float('inf')},   # updated at end
@@ -294,7 +340,6 @@ def train_fold(fold_idx, split):
         for data in train_loader:
             batch = data['hrtf'].to(device, non_blocking=True).float()
             label = data['measurement_point'].to(device, non_blocking=True)
-            head  = data['head_measurements'].to(device, non_blocking=True)
             ears  = data['ear_measurements'].to(device, non_blocking=True)
 
             t = torch.randint(0, diffusion_model.timesteps,
@@ -305,7 +350,7 @@ def train_fold(fold_idx, split):
             with torch.autocast(device_type=device.type, dtype=PRECISION_DTYPE, enabled=USE_FP16):
                 predicted_noise = unet(
                     batch_noisy.float(), t,
-                    labels=label, head_embedding=head, ears_embedding=ears,
+                    labels=label, ears_embedding=ears,
                 )
                 loss, l1_time_c, l1_freq_c = combined_loss(
                     noise, predicted_noise, freq_weight=args.loss_freq_weight,
@@ -336,7 +381,6 @@ def train_fold(fold_idx, split):
             for data in val_loader:
                 batch = data['hrtf'].to(device, non_blocking=True).float()
                 label = data['measurement_point'].to(device, non_blocking=True)
-                head  = data['head_measurements'].to(device, non_blocking=True)
                 ears  = data['ear_measurements'].to(device, non_blocking=True)
 
                 t = torch.randint(0, diffusion_model.timesteps,
@@ -345,7 +389,7 @@ def train_fold(fold_idx, split):
                 with torch.autocast(device_type=device.type, dtype=PRECISION_DTYPE, enabled=USE_FP16):
                     pred = unet(
                         batch_noisy.float(), t,
-                        labels=label, head_embedding=head, ears_embedding=ears,
+                        labels=label, ears_embedding=ears,
                     )
                 val_losses.append(
                     combined_loss(noise, pred, freq_weight=args.loss_freq_weight).item()
@@ -432,6 +476,8 @@ def train_fold(fold_idx, split):
             'early_stop_patience': args.early_stop_patience,
             'ema_decay': args.ema_decay,
             'loss_freq_weight': args.loss_freq_weight,
+            'full_attention': args.full_attention,
+            'model_name': args.model_name,
             'fold': fold_idx + 1,
         },
         metric_dict={'best_val_loss': best_val_loss},
@@ -448,7 +494,7 @@ def infer_fold(fold_idx, split, subj_point_index):
     model_path = ckpt_path(fold_idx)
     if not os.path.exists(model_path):
         print(f"No checkpoint at {model_path} — skipping fold {fold_idx + 1}")
-        return [], []
+        return [], [], [], [], [], [], [], []
 
     fold_tag = f'fold_{fold_idx + 1}'
     print(f"\n{'='*60}")
@@ -487,25 +533,42 @@ def infer_fold(fold_idx, split, subj_point_index):
         os.makedirs(d, exist_ok=True)
 
     # Resume support
+    #
+    # 'subject_ids' and 'nmse_subj' are tracked explicitly (rather than
+    # relying on split['test_subjects'] / iteration order) so every
+    # per-subject metric can be joined back to its subject_id downstream —
+    # required for the paired Wilcoxon signed-rank test on per-subject LSD
+    # (and other subject-level metrics) planned for cross-condition
+    # analysis. .get(...) below keeps older progress.json files (saved
+    # before this field existed) loadable without a KeyError.
+    _empty_progress = {
+        'done_subjects': [], 'subject_ids': [],
+        'lsd_L': [], 'lsd_R': [], 'lsd_avg': [], 'itd': [], 'pbc': [],
+        'nmse': [], 'nmse_subj': [],
+    }
     progress_path = os.path.join(wav_dir, 'progress.json')
     if os.path.exists(progress_path):
         try:
             with open(progress_path) as f:
                 progress = json.load(f)
+            for k, v in _empty_progress.items():
+                progress.setdefault(k, v)
             print(f"  Resuming — {len(progress['done_subjects'])} subjects already done.")
         except (json.JSONDecodeError, KeyError):
             print(f"  Warning: progress.json corrupted, starting fold fresh.")
-            progress = {'done_subjects': [], 'lsd_L': [], 'lsd_R': [], 'lsd_avg': [], 'itd': [], 'pbc': [], 'nmse': []}
+            progress = dict(_empty_progress)
     else:
-        progress = {'done_subjects': [], 'lsd_L': [], 'lsd_R': [], 'lsd_avg': [], 'itd': [], 'pbc': [], 'nmse': []}
+        progress = dict(_empty_progress)
 
-    done_set    = set(progress['done_subjects'])
-    fold_lsd_L  = progress['lsd_L']
-    fold_lsd_R  = progress['lsd_R']
-    fold_lsd_avg= progress['lsd_avg']
-    fold_itd    = progress['itd']
-    fold_pbc    = progress['pbc']
-    fold_nmse   = progress['nmse']
+    done_set     = set(progress['done_subjects'])
+    fold_subject_ids = progress['subject_ids']
+    fold_lsd_L   = progress['lsd_L']
+    fold_lsd_R   = progress['lsd_R']
+    fold_lsd_avg = progress['lsd_avg']
+    fold_itd     = progress['itd']
+    fold_pbc     = progress['pbc']
+    fold_nmse    = progress['nmse']
+    fold_nmse_subj = progress['nmse_subj']
     INFER_BATCH = 64
 
     for subject_id in tqdm.tqdm(split['test_subjects'], desc=f'{fold_tag} infer'):
@@ -517,7 +580,6 @@ def infer_fold(fold_idx, split, subj_point_index):
         nmse_sub  = []
 
         data_ref = hutubs_dataset[subj_point_index[(subject_id, 0)]]
-        head_1 = data_ref['head_measurements'].to(device).float()
         ears_1 = data_ref['ear_measurements'].to(device).float()
         g_std  = data_ref['global_std']
         g_mean = data_ref['global_mean']
@@ -546,7 +608,6 @@ def infer_fold(fold_idx, split, subj_point_index):
 
             x            = torch.randn(b, 2, 256, device=device)
             labels_batch = torch.tensor(pts, device=device)
-            head_batch   = head_1.unsqueeze(0).expand(b, -1)
             ears_batch   = ears_1.unsqueeze(0).expand(b, -1)
 
             with torch.no_grad():
@@ -559,7 +620,6 @@ def infer_fold(fold_idx, split, subj_point_index):
                     predicted_noise = unet(
                         x, t_batch,
                         labels=labels_batch,
-                        head_embedding=head_batch,
                         ears_embedding=ears_batch,
                     )
                     mean = sqrt_recip_t * (x - betas_t * predicted_noise / sqrt_omacp_t)
@@ -616,12 +676,18 @@ def infer_fold(fold_idx, split, subj_point_index):
 
         # ── Aggregate + TensorBoard per subject ─────────────────────────────
         if hrir_sub:
+            # subject_id is appended in lockstep with every subject-level
+            # metric below (rather than derived later from test_subjects),
+            # so a subject skipped for lack of valid points/results never
+            # desyncs the metric arrays from their subject_id.
+            fold_subject_ids.append(int(subject_id))
             fold_lsd_L.append(lsd_L_sub)
             fold_lsd_R.append(lsd_R_sub)
             fold_lsd_avg.append(lsd_avg_sub)
             fold_itd.append(itd_val_sub)
             fold_pbc.append(pbc_val_sub)
             fold_nmse.extend(nmse_sub)
+            fold_nmse_subj.append(float(np.mean(nmse_sub)))
 
             writer.add_scalar(f'Inference/LSD_L_sub_{subject_id}',  float(lsd_L_sub),         fold_idx + 1)
             writer.add_scalar(f'Inference/LSD_R_sub_{subject_id}',  float(lsd_R_sub),         fold_idx + 1)
@@ -638,12 +704,14 @@ def infer_fold(fold_idx, split, subj_point_index):
 
         # ── Persist progress (atomic write — crash-safe) ──────────────────────
         progress['done_subjects'].append(int(subject_id))
+        progress['subject_ids'] = [int(v) for v in fold_subject_ids]
         progress['lsd_L']   = [float(v) for v in fold_lsd_L]
         progress['lsd_R']   = [float(v) for v in fold_lsd_R]
         progress['lsd_avg'] = [float(v) for v in fold_lsd_avg]
         progress['itd']     = [float(v) for v in fold_itd]
         progress['pbc']     = [float(v) for v in fold_pbc]
         progress['nmse']    = [float(v) for v in fold_nmse]
+        progress['nmse_subj'] = [float(v) for v in fold_nmse_subj]
         tmp_path = progress_path + '.tmp'
         with open(tmp_path, 'w') as f:
             json.dump(progress, f)
@@ -659,16 +727,26 @@ def infer_fold(fold_idx, split, subj_point_index):
         writer.add_scalar('Inference/mean_NMSE',    float(np.mean(fold_nmse)),    fold_idx + 1)
 
         # Fold-level .mat
+        # 'subject_id_per_subject' is saved in the same order as every
+        # *_per_subject array above (built via the same per-subject loop,
+        # so a subject skipped for lack of valid points/results can never
+        # desync the arrays). Use this — not 'test_subjects' — to join
+        # per-subject metrics back to subject_id, e.g. for the paired
+        # Wilcoxon signed-rank test on per-subject LSD across conditions.
         sio.savemat(
             os.path.join(MAT_DIR, f'fold_{fold_idx + 1}_summary.mat'),
             {
+                'subject_id_per_subject': np.array(fold_subject_ids, dtype=np.int32),
                 'lsd_L_per_subject':  np.array(fold_lsd_L,   dtype=np.float64),
                 'lsd_R_per_subject':  np.array(fold_lsd_R,   dtype=np.float64),
                 'lsd_avg_per_subject':np.array(fold_lsd_avg, dtype=np.float64),
                 'itd_per_subject':    np.array(fold_itd,     dtype=np.float64),
                 'pbc_per_subject':    np.array(fold_pbc,     dtype=np.float64),
+                'nmse_per_subject':   np.array(fold_nmse_subj, dtype=np.float64),
                 'nmse_per_position':  np.array(fold_nmse,    dtype=np.float64),
                 'test_subjects':      np.array(split['test_subjects'], dtype=np.int32),
+                'model':              MODEL_NAME,
+                'full_attention':     bool(args.full_attention),
                 'mean_lsd_L':         float(np.mean(fold_lsd_L)),
                 'mean_lsd_R':         float(np.mean(fold_lsd_R)),
                 'mean_lsd_avg':       float(np.mean(fold_lsd_avg)),
@@ -687,7 +765,7 @@ def infer_fold(fold_idx, split, subj_point_index):
           f"ITD={np.mean(fold_itd):.2f} µs  "
           f"PBC={np.mean(fold_pbc):.3f} dB  "
           f"NMSE={np.mean(fold_nmse):.4f}")
-    return fold_lsd_L, fold_lsd_R, fold_lsd_avg, fold_itd, fold_pbc, fold_nmse
+    return fold_subject_ids, fold_lsd_L, fold_lsd_R, fold_lsd_avg, fold_itd, fold_pbc, fold_nmse, fold_nmse_subj
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -706,18 +784,21 @@ if args.mode == 'train':
 
 else:
     subj_point_index = build_subject_point_index(hutubs_dataset)
-    all_lsd, all_nmse_vals = [], []
 
-    all_lsd_L, all_lsd_R, all_lsd_avg, all_itd_vals, all_pbc_vals = [], [], [], [], []
+    all_subject_ids, all_lsd_L, all_lsd_R, all_lsd_avg = [], [], [], []
+    all_itd_vals, all_pbc_vals, all_nmse_vals, all_nmse_subj = [], [], [], []
     for fi in fold_indices:
-        fl_L, fl_R, fl_avg, fi_itd, fi_pbc, fn = infer_fold(fi, splits[fi], subj_point_index)
-        all_lsd.extend(fl_avg)
+        fs_ids, fl_L, fl_R, fl_avg, fi_itd, fi_pbc, fn, fn_subj = infer_fold(
+            fi, splits[fi], subj_point_index
+        )
+        all_subject_ids.extend(fs_ids)
         all_lsd_L.extend(fl_L)
         all_lsd_R.extend(fl_R)
         all_lsd_avg.extend(fl_avg)
         all_itd_vals.extend(fi_itd)
         all_pbc_vals.extend(fi_pbc)
         all_nmse_vals.extend(fn)
+        all_nmse_subj.extend(fn_subj)
 
     if all_lsd_avg:
         print(f"\nOverall LSD_L  : {np.mean(all_lsd_L):.3f} ± {np.std(all_lsd_L):.3f} dB")
@@ -730,12 +811,15 @@ else:
         sio.savemat(
             os.path.join(MAT_DIR, 'all_folds_summary.mat'),
             {
+                'subject_id_all': np.array(all_subject_ids, dtype=np.int32),
                 'lsd_L_all':  np.array(all_lsd_L,    dtype=np.float64),
                 'lsd_R_all':  np.array(all_lsd_R,    dtype=np.float64),
                 'lsd_avg_all':np.array(all_lsd_avg,  dtype=np.float64),
                 'itd_all':    np.array(all_itd_vals,  dtype=np.float64),
                 'pbc_all':    np.array(all_pbc_vals,  dtype=np.float64),
                 'nmse_all':   np.array(all_nmse_vals, dtype=np.float64),
+                'model':      MODEL_NAME,
+                'full_attention': bool(args.full_attention),
                 'mean_lsd_L':  float(np.mean(all_lsd_L)),
                 'mean_lsd_R':  float(np.mean(all_lsd_R)),
                 'mean_lsd_avg':float(np.mean(all_lsd_avg)),
@@ -744,16 +828,27 @@ else:
                 'mean_nmse':   float(np.mean(all_nmse_vals)),
             }
         )
-        # Per-subject metrics (one row per subject)
+        # Per-subject metrics (one row per subject). 'subject_id' and
+        # 'model' are included explicitly — not just positional order —
+        # so this file can be loaded alongside other runs (the attention
+        # ablation, the SONICOM ablation conditions) and merged/joined on
+        # 'subject_id' for the paired Wilcoxon signed-rank test on
+        # per-subject LSD (and other metrics here) across conditions.
         pd.DataFrame({
+            'subject_id': all_subject_ids,
+            'model':   MODEL_NAME,
             'lsd_L':   all_lsd_L,
             'lsd_R':   all_lsd_R,
             'lsd_avg': all_lsd_avg,
             'itd':     all_itd_vals,
             'pbc':     all_pbc_vals,
+            'nmse':    all_nmse_subj,
         }).to_excel(os.path.join(RES_DIR, 'metrics_per_subject.xlsx'), index=False)
 
-        # Per-position NMSE (one row per position across all subjects)
+        # Per-position NMSE (one row per position across all subjects).
+        # Finer-grained than the subject-level metrics above; not intended
+        # for the per-subject paired Wilcoxon test, but kept for
+        # diagnostics of position-wise error.
         pd.DataFrame({
             'nmse': all_nmse_vals,
         }).to_excel(os.path.join(RES_DIR, 'nmse_per_position.xlsx'), index=False)

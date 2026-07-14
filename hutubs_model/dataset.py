@@ -15,8 +15,14 @@ MEASUREMENT_POINTS = 440
 
 class HUTUBSDataset(Dataset):
     """
-    HUTUBS dataset loader with:
-      - Sigmoid normalization for anthropometric features (Eq. 4 in paper)
+    HUTUBS dataset loader (HUTUBS_model, Phase 0 baseline) with:
+      - Ear-only anthropometric conditioning. Head/torso columns in the
+        anthropometric CSV are never read, normalized, or exposed —
+        SONICOM's anthropometric CSV only has the 12 ear-specific
+        parameters (d1-d10, theta1, theta2), so the HUTUBS baseline is
+        restricted to the matching ear feature set to keep conditioning
+        inputs consistent across datasets/conditions in later phases.
+      - Sigmoid normalization for the ear features (Eq. 4 in paper)
         instead of z-score, bounding features to (0,1) for conditioning stability.
       - Subject-level indexing to enable proper LOOCV / k-fold splits
         (no cross-subject leakage).
@@ -73,10 +79,13 @@ class HUTUBSDataset(Dataset):
         self.global_mean = float(np.mean(all_hrtf))
         self.global_std = float(np.std(all_hrtf))
 
-        # ── Anthropometric measurements ───────────────────────────────────────
+        # ── Anthropometric measurements (ear-only — head/torso ignored) ────────
+        # Columns 1:14 of the CSV are head/torso measurements; they are
+        # never read into a tensor at all, so there is no path by which
+        # they can leak into conditioning. Only columns 14: (ear features,
+        # d1-d10/theta1/theta2-style parameters) are loaded.
         af_csv = pd.read_csv(self.anthro_csv_path, header=0)
         subject_ids_csv = af_csv.iloc[:, 0].values          # 1-based IDs
-        head_meas_raw = torch.from_numpy(af_csv.iloc[:, 1:14].values.astype(np.float32))
         ear_meas_raw = torch.from_numpy(af_csv.iloc[:, 14:].values.astype(np.float32))
 
         # Drop excluded subjects' rows (e.g. 18/79/92 — present in the CSV
@@ -89,17 +98,9 @@ class HUTUBSDataset(Dataset):
                   f"before computing normalization statistics: "
                   f"{sorted(subject_ids_csv[~valid_mask].tolist())}")
         subject_ids_csv = subject_ids_csv[valid_mask]
-        head_meas_raw   = head_meas_raw[torch.from_numpy(valid_mask)]
         ear_meas_raw    = ear_meas_raw[torch.from_numpy(valid_mask)]
 
         # Replace NaN with column mean before normalization
-        for col in range(head_meas_raw.shape[1]):
-            col_mean = head_meas_raw[:, col][~torch.isnan(head_meas_raw[:, col])].mean()
-            head_meas_raw[:, col] = torch.where(
-                torch.isnan(head_meas_raw[:, col]),
-                col_mean.expand_as(head_meas_raw[:, col]),
-                head_meas_raw[:, col]
-            )
         for col in range(ear_meas_raw.shape[1]):
             col_mean = ear_meas_raw[:, col][~torch.isnan(ear_meas_raw[:, col])].mean()
             ear_meas_raw[:, col] = torch.where(
@@ -109,19 +110,14 @@ class HUTUBSDataset(Dataset):
             )
 
         # Sigmoid normalization (Eq. 4)
-        head_mean = head_meas_raw.mean(dim=0)
-        head_std = head_meas_raw.std(dim=0)
         ear_mean = ear_meas_raw.mean(dim=0)
         ear_std = ear_meas_raw.std(dim=0)
 
-        head_meas_norm = self.sigmoid_normalize(head_meas_raw, head_mean, head_std)
         ear_meas_norm = self.sigmoid_normalize(ear_meas_raw, ear_mean, ear_std)
 
         # Build a lookup: 1-based subject_id -> normalized measurements
-        self.head_meas_by_id = {}
         self.ear_meas_by_id = {}
         for i, sid in enumerate(subject_ids_csv):
-            self.head_meas_by_id[int(sid)] = head_meas_norm[i]
             self.ear_meas_by_id[int(sid)] = ear_meas_norm[i]
 
         # ── Build normalized dataset ──────────────────────────────────────────
@@ -134,7 +130,6 @@ class HUTUBSDataset(Dataset):
                 'subject_id': item['subj_id'],
                 'subj_list_idx': item['subj_list_idx'],
                 'measurement_point': item['point'],
-                'head_measurements': self.head_meas_by_id[item['subj_id']],
                 'ear_measurements': self.ear_meas_by_id[item['subj_id']],
                 'global_std': g_std,
                 'global_mean': g_mean,
@@ -208,6 +203,5 @@ def collate_fn(batch):
         'hrtf': torch.stack([item['hrtf'] for item in batch]),
         'measurement_point': torch.tensor([item['measurement_point'] for item in batch]),
         'subject_id': torch.LongTensor([item['subject_id'] for item in batch]),
-        'head_measurements': torch.stack([item['head_measurements'] for item in batch]),
         'ear_measurements': torch.stack([item['ear_measurements'] for item in batch]),
     }

@@ -88,7 +88,9 @@ class Block(nn.Module):
 
     Normalisation: paper states BatchNorm. We use GroupNorm (improvement)
     because BatchNorm degrades at small spatial lengths in deep encoder
-    levels (L=8 at the bottleneck), and paper does not justify the choice.
+    levels (L=16 at the bottleneck for the default 4-block encoder — see
+    UNet docstring for the full level-by-level breakdown), and paper does
+    not justify the choice.
 
     Conditioning fusion: paper Sec. III-C concatenates the conditioning
     embeddings with the feature map (channel-wise) rather than adding them.
@@ -199,9 +201,11 @@ class Block(nn.Module):
 class UNet(nn.Module):
     """
     U-Net matching paper Sec. III-C as closely as possible:
-      - 5 encoder blocks, channel sizes (4, 8, 16, 32, 64) × base_channels
-      - 5 decoder blocks mirroring the encoder
-      - Self-attention with 4 heads after every downsampling block
+      - 4 encoder blocks (see note below on "5 encoder blocks" in the
+        paper vs. this code), channel sizes (4, 8, 16, 32, 64) × base_channels
+      - 4 decoder blocks mirroring the encoder
+      - Self-attention with 4 heads, by default on the two deepest
+        encoder blocks + bottleneck only (see attn_full_encoder below)
       - Skip connections via concatenation
       - Conditioning injected at every block via FC layers, fused by
         channel-wise concatenation (paper), not addition
@@ -211,17 +215,34 @@ class UNet(nn.Module):
     parameter. Default=1 matches the paper literally. Set to e.g. 8 to get
     (32,64,128,256,512) if more capacity is needed.
 
-    keep_5fold and all HUTUBS features are preserved — only architecture changes.
+    attn_full_encoder: ablation switch (default False). When False
+    (default), attention is restricted to encoder blocks 2-3 (indices
+    >= 2 of 4) — the two deepest/most-compressed blocks — per the
+    "~4-6x speedup, negligible quality loss" rationale in the encoder
+    construction below. Setting attn_full_encoder=True restores attention 
+    on *all* 4 encoder blocks (matching the paper's "after every downsampling 
+    block"), for a controlled comparison of final LSD between the two placements.
+
+    keep_5fold is preserved — only architecture changes.
+
+    Conditioning scope (HUTUBS_model, Phase 0): head_dim defaults to 0
+    (head/torso measurements ignored — see dataset.py), so only
+    timestep, measurement-point label, and ear measurements condition
+    the model by default. head_dim remains a constructor parameter
+    (rather than being removed outright) so the same Block/UNet code can
+    still be reused for future conditions that do supply head features;
+    passing head_dim=0 fully disables the head branch (no head_fc is
+    created and no head_embedding kwarg is read).
     """
     CHANNEL_MULTS = (4, 8, 16, 32, 64)   # paper Sec. III-C
 
     def __init__(self, audio_channels=2, time_embedding_dims=256,
-                 labels=440, head_dim=13, ear_dim=24,
-                 base_channels=8):
+                 labels=440, head_dim=0, ear_dim=24,
+                 base_channels=8, attn_full_encoder=False):
         super().__init__()
 
         seq = [m * base_channels for m in self.CHANNEL_MULTS]  # 5 levels
-        n   = len(seq)   # 5 encoder + 5 decoder blocks
+        n   = len(seq)   # 5 channel levels -> 4 encoder/decoder blocks (see docstring)
 
         # Stem: map audio channels → first channel size
         self.stem   = nn.Conv1d(audio_channels, seq[0], 3, padding=1)
@@ -234,14 +255,18 @@ class UNet(nn.Module):
             ear_dim=ear_dim,
         )
 
-        # Encoder: attention at blocks 3-5 only (indices 2,3,4).
-        # Paper specifies attention after every block, but blocks 1-2
-        # operate at spatial lengths 128 and 64 where attention is
-        # quadratically expensive and contributes little — representations
-        # are not yet compressed enough to benefit from global context.
-        # Gives ~4-6x speedup on the shallow blocks with negligible quality loss.
+        # Encoder: by default, attention only on the two deepest blocks
+        # (indices 2,3 of 4 — see docstring for exact spatial lengths).
+        # Paper specifies attention after every block; attn_full_encoder
+        # restores that behaviour for the ablation comparing final LSD
+        # between "attention everywhere" and this default placement.
+        self.attn_full_encoder = attn_full_encoder
         self.encoder = nn.ModuleList([
-            Block(seq[i], seq[i+1], downsample=True, use_attention=(i >= 2), **common)
+            Block(
+                seq[i], seq[i+1], downsample=True,
+                use_attention=(True if attn_full_encoder else (i >= 2)),
+                **common,
+            )
             for i in range(n - 1)
         ])
 
