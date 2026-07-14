@@ -39,34 +39,23 @@ point / direction-of-arrival, and anthropometric **ear** features.
 | Conv kernels        | k=3 pad=1 (blocks), k=4 s=2 (resample) | same                                   |
 | Self-attention      | 4 heads                                | same                                   |
 | Skip connections    | concatenation                          | same                                   |
-| Conditioning fusion | concatenation                          | **now matches** (was addition — fixed) |
+| Conditioning fusion | concatenation                          | same                                   |
 | LSD metric          | Eq. 9, K=44 bands, 0–15 kHz            | same                                   |
 
 ## What differs from the paper (and why)
 
 | Aspect                   | Paper                                                                   | This code                                                                      | Reason                                                                                                                                                                                                 |
 | ------------------------ | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| U-Net depth              | "5 encoder blocks" (paper text)                                         | 4 encoder blocks (4 transitions across 5 channel levels)                       | See "Blocks vs. channel levels" below — a channel-mult tuple with 5 entries produces 4 transitions, not 5; this is a naming/fencepost mismatch, not a missing layer.                                   |
-| Normalization            | BatchNorm                                                               | GroupNorm                                                                      | BatchNorm degrades at small spatial lengths (bottleneck is L=16, not L=8 — see below)                                                                                                                  |
+| U-Net depth              | "5 encoder blocks" (paper text)                                         | 4 encoder blocks (4 transitions across 5 channel levels)                       | A channel-mult tuple with 5 entries produces 4 transitions, not 5; this is a naming/fencepost mismatch, not a missing layer.                                   |
+| Normalization            | BatchNorm                                                               | GroupNorm                                                                      | BatchNorm degrades at small spatial lengths                                                                                                                |
 | Channel width            | literal (4,8,16,32,64)                                                  | ×`base_channels` (default 8 → 32,64,128,256,512)                               | Literal paper sizes (~40K params) are non-functional; width is now a tunable parameter                                                                                                                 |
-| Self-attention placement | after every downsampling block                                          | by default, only on the two deepest blocks (`--full_attention` restores all 4) | ~4–6× speedup, assumed negligible quality loss at shallow (uncompressed) resolutions — **not yet empirically ablated on HUTUBS_model**; see "Self-attention placement ablation" below.                 |
+| Self-attention placement | after every downsampling block                                          | by default, only on the two deepest blocks (`--full_attention` restores all 4) | ~4–6× speedup, assumed negligible quality loss at shallow (uncompressed) resolutions — **not yet empirically ablated on HUTUBS_model**;               |
 | Loss                     | L2 (implied)                                                            | Combined L1 (time) + L1 (freq. magnitude)                                      | Discrepancy vs. paper's released code (L1); freq. term added as an experiment aligned with the LSD metric                                                                                              |
 | LR schedule              | simple decay (paper text)                                               | StepLR + linear warmup                                                         | Monotonic decay pairs better with early-stopping checkpointing than cosine schedules                                                                                                                   |
-| Evaluation protocol      | random 80/20 **sample-level** split (leaks test subjects into training) | **subject-level** k-fold CV, no leakage                                        | This is possibly the primary source of the ~7.6 dB (ours) vs. 5.1 dB (paper) LSD gap. k-fold was chosen to speed up training, the source code also includes a leaky protocol which has now been fixed. |
-| Anthropometric features  | count/selection unclear                                                 | ear_dim=24 only, head_dim=0 (sigmoid-normalized, Eq. 4)                        | Fixed in Phase 0 (see below): head/torso columns are never loaded, so conditioning matches SONICOM's ear-only anthropometric CSV (d1–d10, θ1, θ2) and later ablation conditions.                       |
+| Evaluation protocol      | LOOCV on version 1 and a Random 80/20 **sample-level** split (leaks test subjects into training) on another version found | **subject-level** k-fold CV, no leakage                                        | This is possibly the primary source of the ~7.6 dB (ours) vs. 5.1 dB (paper) LSD gap. k-fold was chosen to speed up training, the source code also includes a leaky protocol which has now been fixed. |
+| Anthropometric features  | count/selection unclear                                                 | ear_dim=24 only, head_dim=0 (sigmoid-normalized, Eq. 4)                        | Head/torso columns are never loaded, so conditioning matches SONICOM's ear-only anthropometric CSV (d1–d10, θ1, θ2) and later ablation conditions.                       |
 
 ## Blocks vs. channel levels
-
-`CHANNEL_MULTS = (4, 8, 16, 32, 64)` is 5 channel _levels_. A `Block` is
-a _transition_ between two consecutive levels (`seq[i] -> seq[i+1]`),
-so 5 levels produce 4 transitions/blocks (`range(n - 1)` over `n=5` in
-`model.py`), the same fencepost relationship as "5 posts, 4 fence
-panels." Earlier docs/comments in this codebase said "5 encoder
-blocks," which doesn't match what the code does.
-
-With `audio_channels=2`, `HRIR_LEN=256`, and each block halving the
-sequence length on downsample (`k=4, s=2, p=1`), the actual
-level-by-level spatial lengths are:
 
 | Stage                               | Input L | Output L | Attention (default) |
 | ----------------------------------- | ------- | -------- | ------------------- |
@@ -76,17 +65,6 @@ level-by-level spatial lengths are:
 | encoder block 2 (seq2→seq3)         | 64      | 32       | **on** (at L=64)    |
 | encoder block 3 (seq3→seq4)         | 32      | 16       | **on** (at L=32)    |
 | bottleneck (seq4→seq4, no resample) | 16      | 16       | **on** (at L=16)    |
-
-Attention is applied at a block's _input_ resolution, before that
-block's own downsample (see `Block.forward`) — so "attention on the two
-deepest blocks" means L=64 and L=32, and the bottleneck (always
-attended) runs at L=16. An earlier version of this docstring claimed
-the bottleneck was at L=8; that was wrong given the 4-block encoder
-above wasn't accounted for correctly the first time. This also means
-attention's O(L²·C) cost is already fairly small everywhere it's
-applied (4096, 1024, and 256 position pairs respectively) — the
-deepest blocks' conv layers, where channel count grows to 256→512,
-dominate compute more than attention does at this point.
 
 ## Self-attention placement ablation
 
@@ -114,13 +92,11 @@ columns — so a model conditioned on head/torso features can't be
 directly compared against, or reused as a pretrained checkpoint for,
 the SONICOM ablation conditions.
 
-Fix: `dataset.py` no longer reads the head/torso CSV columns at all
+So `dataset.py` no longer reads the head/torso CSV columns at all
 (only ear columns are loaded, normalized, and exposed), and `model.py` /
 `main.py` default to `head_dim=0`, which fully disables the head
 conditioning branch. Subjects 18, 79, and 92 continue to be excluded
-(incomplete/NaN anthropometric rows) — `dataset.py`'s
-`EXCLUDED_SUBJECTS` set and the pre-normalization row-drop were already
-correct and are unchanged by this fix.
+(incomplete/NaN anthropometric rows)
 
 ## EMA + combined loss (new)
 
