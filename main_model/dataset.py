@@ -70,7 +70,11 @@ class HRTFDataset(Dataset):
         # so head/torso columns (present in HUTUBS, absent in SONICOM) never
         # need to be counted or sliced around -- this is what lets the same
         # loading code work for both CSVs.
-        af_csv = pd.read_csv(self.anthro_csv_path, header=0)
+        try:
+            af_csv = pd.read_csv(self.anthro_csv_path, header=0, encoding='utf-8')
+        except UnicodeDecodeError:
+            print(f"[anthro] {self.anthro_csv_path} isn't valid UTF-8 -- retrying as Latin-1")
+            af_csv = pd.read_csv(self.anthro_csv_path, header=0, encoding='latin-1')
         ear_cols = [c for c in af_csv.columns if c.startswith('L_') or c.startswith('R_')]
         subject_ids_csv = af_csv['SubjectID'].values
         ear_meas_raw = torch.from_numpy(af_csv[ear_cols].values.astype(np.float32))
