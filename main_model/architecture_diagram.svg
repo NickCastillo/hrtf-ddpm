@@ -1,0 +1,195 @@
+<svg viewBox="0 0 1400 620" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>HRTF DDPM UNet architecture and conditioning</title>
+<desc>Top panel shows the internals of one conditioning block: conv1, concatenation of active conditioning signals, a 1x1 fusion conv, conv2, optional attention, and resample. A legend lists the four SONICOM ablation conditions. Bottom panel shows the full UNet dataflow from input through encoder, bottleneck, and decoder blocks with skip connections, plus a shared conditioning bus feeding every block.</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="#9ca3af"/>
+</marker>
+<marker id="arrowAccent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/>
+</marker>
+</defs>
+<style>
+  .bg { fill: #ffffff; }
+  .box { fill: #f5f5f7; stroke: #9ca3af; stroke-width:1.2; }
+  .box-attn { fill: #2563eb; fill-opacity:0.10; stroke: #2563eb; stroke-width:1.3; }
+  .box-dashed { fill: #f5f5f7; stroke: #9ca3af; stroke-width:1.2; stroke-dasharray:4 3; }
+  .pill { fill: #ffffff; stroke: #d8d8dc; stroke-width:1; }
+  .title { font: 600 12px sans-serif; fill: #1a1a1a; }
+  .sub { font: 10px sans-serif; fill: #6b6b6b; }
+  .panel-h { font: 600 13px sans-serif; fill: #1a1a1a; }
+  .flow { stroke: #9ca3af; stroke-width:1.4; fill:none; marker-end:url(#arrow); }
+  .skip { stroke: #2563eb; stroke-width:1.3; fill:none; stroke-dasharray:5 3; marker-end:url(#arrowAccent); }
+  .cond-line { stroke: #9ca3af; stroke-width:1; fill:none; marker-end:url(#arrow); }
+  .note { font: italic 10px sans-serif; fill: #6b6b6b; }
+  .legend-yes { font: 600 11px sans-serif; fill: #2563eb; }
+  .legend-no { font: 11px sans-serif; fill: #6b6b6b; }
+</style>
+<rect class="bg" x="0" y="0" width="1400" height="620"/>
+
+<!-- ═══════════════ PANEL 1: inside one Block ═══════════════ -->
+<text class="panel-h" x="20" y="24">Inside every encoder / decoder block</text>
+
+<!-- boxes -->
+<g>
+  <rect class="box" x="20" y="55" width="110" height="55" rx="6"/>
+  <text class="title" x="75" y="78" text-anchor="middle">x_t</text>
+  <text class="sub" x="75" y="94" text-anchor="middle">noisy HRIR (2×256)</text>
+
+  <rect class="box" x="160" y="55" width="100" height="55" rx="6"/>
+  <text class="title" x="210" y="78" text-anchor="middle">conv1</text>
+  <text class="sub" x="210" y="94" text-anchor="middle">Conv1d k3+GN+ReLU</text>
+
+  <rect class="box" x="290" y="55" width="140" height="55" rx="6"/>
+  <text class="title" x="360" y="78" text-anchor="middle">concat</text>
+  <text class="sub" x="360" y="94" text-anchor="middle">feature + active signals</text>
+
+  <rect class="box-attn" x="460" y="55" width="130" height="55" rx="6"/>
+  <text class="title" x="525" y="78" text-anchor="middle">cond_fuse</text>
+  <text class="sub" x="525" y="94" text-anchor="middle">1×1 conv → channels_out</text>
+
+  <rect class="box" x="620" y="55" width="100" height="55" rx="6"/>
+  <text class="title" x="670" y="78" text-anchor="middle">conv2</text>
+  <text class="sub" x="670" y="94" text-anchor="middle">Conv1d k3+GN</text>
+
+  <rect class="box-dashed" x="750" y="55" width="110" height="55" rx="6"/>
+  <text class="title" x="805" y="78" text-anchor="middle">attention</text>
+  <text class="sub" x="805" y="94" text-anchor="middle">optional, 4-head</text>
+
+  <rect class="box" x="890" y="55" width="110" height="55" rx="6"/>
+  <text class="title" x="945" y="78" text-anchor="middle">resample</text>
+  <text class="sub" x="945" y="94" text-anchor="middle">stride-2 conv/deconv</text>
+
+  <rect class="box" x="1030" y="55" width="120" height="55" rx="6"/>
+  <text class="title" x="1090" y="78" text-anchor="middle">block output</text>
+  <text class="sub" x="1090" y="94" text-anchor="middle">→ next block</text>
+</g>
+
+<!-- flow arrows panel 1 -->
+<path class="flow" d="M130,82 H158"/>
+<path class="flow" d="M260,82 H288"/>
+<path class="flow" d="M430,82 H458"/>
+<path class="flow" d="M590,82 H618"/>
+<path class="flow" d="M720,82 H748"/>
+<path class="flow" d="M860,82 H888"/>
+<path class="flow" d="M1000,82 H1028"/>
+
+<!-- conditioning pills feeding into concat -->
+<rect class="pill" x="150" y="150" width="150" height="46" rx="6"/>
+<text class="title" x="225" y="169" text-anchor="middle">t → sinusoidal + MLP</text>
+<text class="sub" x="225" y="184" text-anchor="middle">always active</text>
+
+<rect class="pill" x="315" y="150" width="150" height="46" rx="6"/>
+<text class="title" x="390" y="169" text-anchor="middle">position label → embed</text>
+<text class="sub" x="390" y="184" text-anchor="middle">always active</text>
+
+<rect class="pill" x="480" y="150" width="160" height="46" rx="6"/>
+<text class="title" x="560" y="169" text-anchor="middle">ear measurements (24-d)</text>
+<text class="sub" x="560" y="184" text-anchor="middle">conditions B, D</text>
+
+<rect class="pill" x="655" y="150" width="185" height="46" rx="6"/>
+<text class="title" x="747" y="169" text-anchor="middle">ear images → CNN encoder</text>
+<text class="sub" x="747" y="184" text-anchor="middle">conditions C, D (once per sample)</text>
+
+<path class="cond-line" d="M225,150 Q280,120 345,112"/>
+<path class="cond-line" d="M390,150 Q370,120 355,112"/>
+<path class="cond-line" d="M560,150 Q460,120 375,112"/>
+<path class="cond-line" d="M747,150 Q550,110 385,112"/>
+
+<!-- legend: four conditions -->
+<g>
+  <rect class="box" x="1090" y="130" width="290" height="150" rx="8"/>
+  <text class="panel-h" x="1105" y="152">Four conditions (SONICOM)</text>
+  <text class="sub" x="1105" y="170">cond.   ear feats   ear images</text>
+  <line x1="1105" y1="177" x2="1365" y2="177" stroke="#d8d8dc"/>
+  <text class="title" x="1105" y="196">A</text><text class="legend-no" x="1160" y="196">no</text><text class="legend-no" x="1250" y="196">no</text>
+  <text class="title" x="1105" y="219">B</text><text class="legend-yes" x="1160" y="219">yes</text><text class="legend-no" x="1250" y="219">no</text>
+  <text class="title" x="1105" y="242">C</text><text class="legend-no" x="1160" y="242">no</text><text class="legend-yes" x="1250" y="242">yes</text>
+  <text class="title" x="1105" y="265">D</text><text class="legend-yes" x="1160" y="265">yes</text><text class="legend-yes" x="1250" y="265">yes</text>
+  <text class="note" x="1105" y="273" dy="10">B alone matches HUTUBS's active branches</text>
+</g>
+
+<!-- ═══════════════ PANEL 2: full U-Net dataflow ═══════════════ -->
+<text class="panel-h" x="20" y="335">Full U-Net dataflow (4 encoder blocks → bottleneck → 4 decoder blocks)</text>
+
+<!-- skip arcs (behind main row) -->
+<path class="skip" d="M262,398 Q680,300 1102,398"/>
+<path class="skip" d="M362,398 Q680,325 1002,398"/>
+<path class="skip" d="M462,398 Q680,350 902,398"/>
+<path class="skip" d="M562,398 Q680,372 802,398"/>
+<text class="note" x="20" y="300">dashed arcs = skip connections (concat), matched by depth</text>
+
+<!-- main row boxes -->
+<g>
+  <rect class="box" x="20" y="398" width="80" height="55" rx="6"/>
+  <text class="title" x="60" y="421" text-anchor="middle">input</text>
+  <text class="sub" x="60" y="437" text-anchor="middle">HRIR+noise</text>
+
+  <rect class="box" x="120" y="398" width="80" height="55" rx="6"/>
+  <text class="title" x="160" y="421" text-anchor="middle">stem</text>
+  <text class="sub" x="160" y="437" text-anchor="middle">Conv1d proj</text>
+
+  <rect class="box" x="220" y="398" width="85" height="55" rx="6"/>
+  <text class="title" x="262" y="421" text-anchor="middle">enc1</text>
+  <text class="sub" x="262" y="437" text-anchor="middle">256→128</text>
+
+  <rect class="box" x="320" y="398" width="85" height="55" rx="6"/>
+  <text class="title" x="362" y="421" text-anchor="middle">enc2</text>
+  <text class="sub" x="362" y="437" text-anchor="middle">128→64</text>
+
+  <rect class="box-attn" x="420" y="398" width="85" height="55" rx="6"/>
+  <text class="title" x="462" y="421" text-anchor="middle">enc3 ⚡</text>
+  <text class="sub" x="462" y="437" text-anchor="middle">64→32</text>
+
+  <rect class="box-attn" x="520" y="398" width="85" height="55" rx="6"/>
+  <text class="title" x="562" y="421" text-anchor="middle">enc4 ⚡</text>
+  <text class="sub" x="562" y="437" text-anchor="middle">32→16</text>
+
+  <rect class="box-attn" x="625" y="398" width="110" height="55" rx="6"/>
+  <text class="title" x="680" y="421" text-anchor="middle">bottleneck ⚡</text>
+  <text class="sub" x="680" y="437" text-anchor="middle">16→16</text>
+
+  <rect class="box" x="755" y="398" width="85" height="55" rx="6"/>
+  <text class="title" x="797" y="421" text-anchor="middle">dec1</text>
+  <text class="sub" x="797" y="437" text-anchor="middle">16→32</text>
+
+  <rect class="box" x="855" y="398" width="85" height="55" rx="6"/>
+  <text class="title" x="897" y="421" text-anchor="middle">dec2</text>
+  <text class="sub" x="897" y="437" text-anchor="middle">32→64</text>
+
+  <rect class="box" x="955" y="398" width="85" height="55" rx="6"/>
+  <text class="title" x="997" y="421" text-anchor="middle">dec3</text>
+  <text class="sub" x="997" y="437" text-anchor="middle">64→128</text>
+
+  <rect class="box" x="1055" y="398" width="85" height="55" rx="6"/>
+  <text class="title" x="1097" y="421" text-anchor="middle">dec4</text>
+  <text class="sub" x="1097" y="437" text-anchor="middle">128→256</text>
+
+  <rect class="box" x="1155" y="398" width="80" height="55" rx="6"/>
+  <text class="title" x="1195" y="421" text-anchor="middle">out</text>
+  <text class="sub" x="1195" y="437" text-anchor="middle">Conv1d proj</text>
+
+  <rect class="box" x="1255" y="398" width="120" height="55" rx="6"/>
+  <text class="title" x="1315" y="421" text-anchor="middle">pred. noise</text>
+  <text class="sub" x="1315" y="437" text-anchor="middle">(2×256)</text>
+</g>
+
+<!-- flow arrows panel 2 -->
+<path class="flow" d="M100,425 H118"/>
+<path class="flow" d="M200,425 H218"/>
+<path class="flow" d="M305,425 H318"/>
+<path class="flow" d="M405,425 H418"/>
+<path class="flow" d="M505,425 H518"/>
+<path class="flow" d="M605,425 H623"/>
+<path class="flow" d="M735,425 H753"/>
+<path class="flow" d="M840,425 H853"/>
+<path class="flow" d="M940,425 H953"/>
+<path class="flow" d="M1040,425 H1053"/>
+<path class="flow" d="M1140,425 H1153"/>
+<path class="flow" d="M1235,425 H1253"/>
+
+<!-- conditioning bus -->
+<line x1="262" y1="480" x2="1097" y2="480" stroke="#9ca3af" stroke-width="1.2"/>
+<path class="cond-line" d="M680,500 V483"/>
+<text class="note" x="680" y="516" text-anchor="middle">conditioning (t, label, ear?, image?) fused into every block above — see detail panel</text>
+</svg>

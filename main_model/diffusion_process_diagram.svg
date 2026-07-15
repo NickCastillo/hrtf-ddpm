@@ -1,0 +1,98 @@
+<svg viewBox="0 0 1400 600" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>DDPM forward and reverse diffusion process</title>
+<desc>Top panel: training-time forward process, where a clean HRIR x0 is noised in one closed-form step to xt at a random timestep, the UNet predicts the added noise, and the prediction is compared against the true noise to form the loss which backpropagates into the UNet. Bottom panel: sampling-time reverse process, starting from pure Gaussian noise xT and iterating the same UNet 600 times, each time predicting noise and stepping to a slightly less noisy xt-1, until reaching a generated HRIR x0.</desc>
+<defs>
+<marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#9ca3af"/></marker>
+<marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker>
+<marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#dc7a2b"/></marker>
+</defs>
+<style>
+  .box { fill:#f5f5f7; stroke:#9ca3af; stroke-width:1.2; }
+  .box-unet { fill:#2563eb; fill-opacity:0.10; stroke:#2563eb; stroke-width:1.4; }
+  .box-noise { fill:#fef3e8; stroke:#dc7a2b; stroke-width:1.2; }
+  .title { font:600 12px sans-serif; fill:#1a1a1a; }
+  .sub { font:10px sans-serif; fill:#6b6b6b; }
+  .formula { font:10px monospace; fill:#374151; }
+  .panel-h { font:600 13px sans-serif; fill:#1a1a1a; }
+  .flow { stroke:#9ca3af; stroke-width:1.4; fill:none; marker-end:url(#a1); }
+  .back { stroke:#2563eb; stroke-width:1.3; fill:none; stroke-dasharray:5 3; marker-end:url(#a2); }
+  .loop { stroke:#dc7a2b; stroke-width:1.4; fill:none; marker-end:url(#a3); }
+  .note { font:italic 10px sans-serif; fill:#6b6b6b; }
+</style>
+<rect x="0" y="0" width="1400" height="600" fill="#ffffff"/>
+
+<!-- PANEL 1: forward process / training -->
+<text class="panel-h" x="20" y="24">Forward process — training (one closed-form noising step per batch)</text>
+
+<rect class="box" x="20" y="55" width="110" height="55" rx="6"/>
+<text class="title" x="75" y="78" text-anchor="middle">x₀</text>
+<text class="sub" x="75" y="94" text-anchor="middle">clean HRIR</text>
+
+<path class="flow" d="M130,82 H268"/>
+<text class="formula" x="200" y="72" text-anchor="middle">t ~ U(0,600)</text>
+
+<rect class="box" x="270" y="55" width="130" height="55" rx="6"/>
+<text class="title" x="335" y="78" text-anchor="middle">x_t</text>
+<text class="sub" x="335" y="94" text-anchor="middle">noisy HRIR</text>
+<text class="formula" x="335" y="122" text-anchor="middle">x_t=√ᾱt·x₀+√(1-ᾱt)·ε</text>
+
+<rect class="box-noise" x="270" y="150" width="130" height="50" rx="6"/>
+<text class="title" x="335" y="171" text-anchor="middle">ε (true noise)</text>
+<text class="sub" x="335" y="186" text-anchor="middle">sampled ~ N(0,I)</text>
+
+<path class="flow" d="M400,82 Q460,82 490,105"/>
+<path class="flow" d="M400,175 Q460,175 490,145"/>
+
+<rect class="box-unet" x="500" y="90" width="230" height="70" rx="8"/>
+<text class="title" x="615" y="118" text-anchor="middle">UNet ε_θ(x_t, t, cond)</text>
+<text class="sub" x="615" y="134" text-anchor="middle">cond = label, ear?, image?</text>
+<text class="sub" x="615" y="148" text-anchor="middle">— see block diagram —</text>
+
+<path class="flow" d="M730,125 H818"/>
+
+<rect class="box" x="820" y="95" width="140" height="55" rx="6"/>
+<text class="title" x="890" y="118" text-anchor="middle">ε̂ (predicted)</text>
+<text class="sub" x="890" y="134" text-anchor="middle">UNet output</text>
+
+<path class="flow" d="M960,122 Q1010,122 1030,148"/>
+<path class="flow" d="M400,175 Q1000,230 1030,168"/>
+
+<rect class="box" x="1040" y="130" width="200" height="60" rx="6"/>
+<text class="title" x="1140" y="152" text-anchor="middle">loss</text>
+<text class="sub" x="1140" y="167" text-anchor="middle">(1-w)·L1(ε,ε̂) + w·L1(|FFT ε|,|FFT ε̂|)</text>
+<text class="sub" x="1140" y="181" text-anchor="middle">w = --loss_freq_weight</text>
+
+<path class="back" d="M1040,155 Q850,220 620,163"/>
+<text class="note" x="850" y="230">backprop — one UNet call per training batch, any t</text>
+
+<!-- PANEL 2: reverse process / sampling -->
+<text class="panel-h" x="20" y="290">Reverse process — sampling (600 sequential steps, t = 599 → 0)</text>
+
+<rect class="box-noise" x="20" y="360" width="120" height="60" rx="6"/>
+<text class="title" x="80" y="384" text-anchor="middle">x_T</text>
+<text class="sub" x="80" y="400" text-anchor="middle">pure noise ~N(0,I)</text>
+
+<path class="flow" d="M140,390 H298"/>
+
+<rect class="box-unet" x="300" y="360" width="200" height="60" rx="8"/>
+<text class="title" x="400" y="384" text-anchor="middle">UNet ε_θ(x_t, t, cond)</text>
+<text class="sub" x="400" y="400" text-anchor="middle">same weights as training</text>
+
+<path class="flow" d="M500,390 H638"/>
+
+<rect class="box" x="640" y="355" width="230" height="70" rx="6"/>
+<text class="title" x="755" y="378" text-anchor="middle">step to x_(t-1)</text>
+<text class="formula" x="755" y="394" text-anchor="middle" style="font-size:9px">= (x_t - βt/√(1-ᾱt)·ε̂)/√αt</text>
+<text class="formula" x="755" y="407" text-anchor="middle" style="font-size:9px">+ √βt·z   (z=0 if t=0)</text>
+
+<path class="loop" d="M755,355 Q560,270 400,358"/>
+<text class="note" x="560" y="270" text-anchor="middle">repeat 600×, t → t-1</text>
+
+<path class="flow" d="M870,390 H998"/>
+<rect class="box" x="1000" y="360" width="130" height="60" rx="6"/>
+<text class="title" x="1065" y="384" text-anchor="middle">x₀</text>
+<text class="sub" x="1065" y="400" text-anchor="middle">generated HRIR</text>
+
+<text class="note" x="20" y="450">In this codebase, positions within a subject are batched together (INFER_BATCH=64) — still 600 sequential timesteps, just parallel across positions.</text>
+<text class="note" x="20" y="470">Training needs one UNet call per batch; sampling needs 600 — this asymmetry is why inference is the slow side of a DDPM, not training.</text>
+</svg>
