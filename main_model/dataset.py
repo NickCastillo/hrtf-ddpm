@@ -71,10 +71,17 @@ class HRTFDataset(Dataset):
         # need to be counted or sliced around -- this is what lets the same
         # loading code work for both CSVs.
         try:
-            af_csv = pd.read_csv(self.anthro_csv_path, header=0, encoding='utf-8')
+            af_csv = pd.read_csv(self.anthro_csv_path, header=0, sep=None, engine='python', encoding='utf-8')
         except UnicodeDecodeError:
             print(f"[anthro] {self.anthro_csv_path} isn't valid UTF-8 -- retrying as Latin-1")
-            af_csv = pd.read_csv(self.anthro_csv_path, header=0, encoding='latin-1')
+            af_csv = pd.read_csv(self.anthro_csv_path, header=0, sep=None, engine='python', encoding='latin-1')
+        if 'SubjectID' not in af_csv.columns:
+            raise ValueError(
+                f"'{self.anthro_csv_path}' has no 'SubjectID' column (found: {list(af_csv.columns)}). "
+                f"This loader expects the wide layout (SubjectID, L_d1..L_theta2, R_d1..R_theta2) -- "
+                f"if this is SONICOM's original long-format export (SONICOM ID/Ear/d1(cm).. columns), "
+                f"it needs reshaping first, not just re-pointing this path at it."
+            )
         ear_cols = [c for c in af_csv.columns if c.startswith('L_') or c.startswith('R_')]
         subject_ids_csv = af_csv['SubjectID'].values
         ear_meas_raw = torch.from_numpy(af_csv[ear_cols].values.astype(np.float32))
