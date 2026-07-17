@@ -112,6 +112,10 @@ class HRTFDataset(Dataset):
         # ── Measurement grid: read point count from the data itself ────────────
         self.measurement_points = sofa_files[0][1].getDataIR().shape[0]
 
+        self.image_by_id = {}
+        if self.image_dir is not None:
+            self.image_by_id = {sid: self._load_ear_image(sid) for sid in self.valid_subject_indices}
+
         # ── Collect all HRIR points ─────────────────────────────────────────────
         hrtf_points = []
         for subj_list_idx, (subj_id, sofa_file) in enumerate(sofa_files):
@@ -173,12 +177,10 @@ class HRTFDataset(Dataset):
     def __getitem__(self, idx):
         item = self.normalized_dataset[idx]
         if self.image_dir is not None:
-            # Images are decoded on demand rather than precomputed/cached in
-            # normalized_dataset -- there can be hundreds of HRIR points per
-            # subject, and re-storing the same image tensor for each one
-            # would be wasteful; a 128x128 JPEG decode is cheap per sample.
+            # Cheap dict lookup into the per-subject cache built in load_data()
+            # -- no disk I/O or decoding happens here.
             item = dict(item)
-            item['image'] = self._load_ear_image(item['subject_id'])
+            item['image'] = self.image_by_id[item['subject_id']]
         return item
 
     # ── Subject-level k-fold splits (no leakage) ─────────────────────────────
