@@ -283,7 +283,30 @@ def _gammatone_response(freqs, cf, bw_factor=1.019):
     return response / (response.max() + 1e-12)
 
 
-def load_matching_state_dict(model, checkpoint_path, use_ema=True):
+# ── Pretrained partial-weight transfer ─────────────────────────────────────────
+
+def _active_branch_signature(head_dim, ear_dim, image_dim):
+    """
+    Boolean signature of which conditioning branches are active, in the
+    exact order Block.forward concatenates them (head, ear, image — label
+    is always concatenated whenever `labels` is set and doesn't affect
+    cond_fuse's channel count differently across HUTUBS/SONICOM since both
+    use a non-zero label count, so it's left out of the signature).
+
+    Two models can have identical cond_fuse *shape* (same number of active
+    branches) while fusing completely different *signals* -- e.g. condition
+    B (ear_dim=24, image_dim=0) and condition C (ear_dim=0, image_dim=32)
+    both concatenate exactly 4 tensors ([o, time, <signal>, label]), so
+    their cond_fuse layers are the same shape despite one mixing in ear
+    measurements and the other mixing in image features. Matching purely
+    by name+shape can't tell these apart; this signature can.
+    """
+    return (bool(head_dim), bool(ear_dim), bool(image_dim))
+
+
+def load_matching_state_dict(model, checkpoint_path, use_ema=True,
+                              src_head_dim=0, src_ear_dim=24, src_image_dim=0,
+                              dst_head_dim=0, dst_ear_dim=24, dst_image_dim=0):
     """
     Partially initialize `model` from a checkpoint that may come from a
     differently-configured run (e.g. a HUTUBS backbone reused for a SONICOM
@@ -294,21 +317,56 @@ def load_matching_state_dict(model, checkpoint_path, use_ema=True):
     branch that didn't exist before (the image encoder) -- is left at its
     fresh random init instead of erroring.
 
+    BUG FIX (see _active_branch_signature docstring): cond_fuse's shape
+    only depends on *how many* conditioning signals are concatenated, not
+    *which* ones. Condition B (ear_dim=24, image_dim=0) and condition C
+    (ear_dim=0, image_dim=32) both concatenate exactly 4 tensors
+    ([o, time, <signal>, label]), so their cond_fuse layers have identical
+    shape despite fusing entirely different signals. Matching by name+shape
+    alone silently transferred B/HUTUBS's ear-tuned cond_fuse weights into
+    C's image-fusion layer. Any parameter belonging to a cond_fuse module
+    is now additionally gated on the source and destination having the
+    *same* active-branch signature (which branches, not just how many) --
+    the src_*/dst_* args describe that for the checkpoint being loaded
+    from and the model being loaded into, respectively. Defaults match the
+    HUTUBS baseline (ear-only) as the source and condition B as the
+    destination, i.e. the one case where transfer was always safe anyway;
+    pass explicit dims for every other condition (see main.py call site).
+
     This is the one mechanism behind every condition's init: condition B
     (same active branches as HUTUBS) ends up loading almost everything;
-    A/C/D load only the shared backbone. Nothing here is condition-specific
-    -- it's just shape matching.
+    A/D load only the shared backbone (mismatched shape); C additionally
+    loses cond_fuse despite the shape match, per the signature check above.
     """
     ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     src = ckpt['ema_state_dict'] if (use_ema and 'ema_state_dict' in ckpt) else ckpt['model_state_dict']
     dst = model.state_dict()
 
-    matched = {k: v for k, v in src.items() if k in dst and v.shape == dst[k].shape}
+    src_sig = _active_branch_signature(src_head_dim, src_ear_dim, src_image_dim)
+    dst_sig = _active_branch_signature(dst_head_dim, dst_ear_dim, dst_image_dim)
+    cond_fuse_safe = (src_sig == dst_sig)
+
+    matched = {}
+    blocked_cond_fuse = 0
+    for k, v in src.items():
+        if k not in dst or v.shape != dst[k].shape:
+            continue
+        if 'cond_fuse' in k and not cond_fuse_safe:
+            blocked_cond_fuse += 1
+            continue
+        matched[k] = v
+
     dst.update(matched)
     model.load_state_dict(dst)
 
-    print(f"[pretrained] {checkpoint_path}: loaded {len(matched)}/{len(dst)} tensors "
-          f"({len(dst) - len(matched)} left at random init — shape/name mismatch)")
+    msg = (f"[pretrained] {checkpoint_path}: loaded {len(matched)}/{len(dst)} tensors "
+           f"({len(dst) - len(matched)} left at random init — shape/name mismatch")
+    if blocked_cond_fuse:
+        msg += (f", of which {blocked_cond_fuse} were cond_fuse tensors blocked by the "
+                f"branch-signature check (shape matched but signals differ: "
+                f"src={src_sig} dst={dst_sig})")
+    msg += ")"
+    print(msg)
 
 
 def pbc(hrir_test_list, hrir_gen_list, sr=SR, n_filters=40):

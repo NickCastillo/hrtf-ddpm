@@ -28,6 +28,16 @@ CONDITIONS = {
     'D': dict(ear_dim=24, use_image=True),    # anthro + image
 }
 
+# HUTUBS never has images and never has head/torso data -- its checkpoints
+# are always trained as condition B (ear-only). This is the *source*
+# composition load_matching_state_dict needs (see --pretrained_checkpoint
+# help and the call site in train_fold below) to correctly gate cond_fuse
+# transfer: matching this against each destination condition's own
+# composition is what stops e.g. condition C silently inheriting B's
+# ear-tuned cond_fuse weights just because the tensor shapes happen to
+# coincide (see load_matching_state_dict's docstring in utils.py).
+HUTUBS_CONDITION = CONDITIONS['B']
+
 # ── Device ────────────────────────────────────────────────────────────────────
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
@@ -364,7 +374,27 @@ def train_fold(fold_idx, split):
     if args.pretrained_checkpoint:
         # Partially init from the matching HUTUBS fold -- see
         # load_matching_state_dict in utils.py for what does/doesn't transfer.
-        load_matching_state_dict(unet, os.path.join(args.pretrained_checkpoint, f'unet_fold{fold_idx + 1}.pt'))
+        #
+        # HUTUBS checkpoints are always trained as condition B (ear-only —
+        # see the --dataset hutubs override above), so that's the *source*
+        # composition. The *destination* composition is whatever this run's
+        # --condition actually is. Passing both explicitly (rather than
+        # relying on shape alone) is what stops cond_fuse being transferred
+        # into a condition whose active branches don't actually match --
+        # e.g. condition C (image-only) coincidentally has the same
+        # cond_fuse shape as HUTUBS/B (4 concatenated tensors either way)
+        # despite fusing a completely different signal. See
+        # load_matching_state_dict's docstring for the full explanation.
+        load_matching_state_dict(
+            unet,
+            os.path.join(args.pretrained_checkpoint, f'unet_fold{fold_idx + 1}.pt'),
+            src_head_dim=0,
+            src_ear_dim=HUTUBS_CONDITION['ear_dim'],
+            src_image_dim=(IMAGE_FEAT_DIM if HUTUBS_CONDITION['use_image'] else 0),
+            dst_head_dim=0,
+            dst_ear_dim=condition['ear_dim'],
+            dst_image_dim=(IMAGE_FEAT_DIM if condition['use_image'] else 0),
+        )
     optimizer = torch.optim.Adam(unet.parameters(), lr=args.lr)
     ema = EMA(unet, decay=args.ema_decay)
 
