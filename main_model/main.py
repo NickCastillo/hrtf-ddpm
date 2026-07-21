@@ -50,8 +50,10 @@ def str2bool(v):
 parser = argparse.ArgumentParser(description='HRTF DDPM — per-fold training & inference')
 parser.add_argument('--mode', type=str, choices=['train', 'infer'], required=True,
                     help='"train" or "infer"')
-parser.add_argument('--fold', type=int, default=None,
-                    help='Which fold to run (1-based). Omit to run all folds.')
+parser.add_argument('--fold', type=int, nargs='+', default=None,
+                    help='Which fold(s) to run (1-based), space-separated, '
+                         'e.g. --fold 2 3 4 5. A single value (--fold 2) still '
+                         'works as before. Omit to run all folds.')
 parser.add_argument('--BATCH_SIZE', type=int, default=128)
 parser.add_argument('--epochs', type=int, default=1000)
 # ── LR & Scheduler ────────────────────────────────────────────────────────────
