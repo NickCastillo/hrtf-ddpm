@@ -274,9 +274,10 @@ else:
 
 # Resolve folds to run
 if args.fold is not None:
-    assert 1 <= args.fold <= len(splits), \
-        f"--fold must be 1–{len(splits)}, got {args.fold}"
-    fold_indices = [args.fold - 1]
+    for f in args.fold:
+        assert 1 <= f <= len(splits), \
+            f"--fold values must be 1–{len(splits)}, got {f}"
+    fold_indices = [f - 1 for f in args.fold]
 else:
     fold_indices = list(range(len(splits)))
 
@@ -382,7 +383,10 @@ def train_fold(fold_idx, split):
         #
         # reset_cond_fuse=True (default, see --reset_cond_fuse) forces every
         # condition's cond_fuse layers to start random rather than inherit
-        # HUTUBS's conditioning-signal blending weights -- Everything else (stem, conv1/conv2,
+        # HUTUBS's conditioning-signal blending weights -- applies the same
+        # way to all four conditions now, including B, whose composition
+        # matches HUTUBS's closely enough that cond_fuse would otherwise
+        # transfer "correctly". Everything else (stem, conv1/conv2,
         # resample, attention, time_mlp, ear_fc, image_fc) still transfers
         # normally whenever name+shape match.
         load_matching_state_dict(
