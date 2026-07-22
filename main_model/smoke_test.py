@@ -61,8 +61,8 @@ def test_forward_backward(labels, condition_key, batch=2):
     x      = torch.randn(batch, 2, 256)
     t      = torch.randint(0, 600, (batch,))
     label  = torch.randint(0, labels, (batch,))
-    ears   = torch.rand(batch, 24)          if cond['ear_dim']   else None
-    images = torch.rand(batch, 6, 128, 128) if cond['use_image'] else None
+    ears   = torch.rand(batch, 24)             if cond['ear_dim']   else None
+    images = torch.rand(batch, 2, 3, 224, 224) if cond['use_image'] else None
 
     out = unet(x, t, labels=label, ears_embedding=ears, images=images)
     check("output shape matches input (B,2,256)", tuple(out.shape) == tuple(x.shape))
@@ -116,7 +116,7 @@ def test_dataset(args):
               f"{len(ds.valid_subject_indices)} subjects")
         sample = ds[0]
         check("sample has image", 'image' in sample)
-        check("image shape is (6,128,128)", tuple(sample['image'].shape) == (6, 128, 128))
+        check("image shape is (2,3,224,224)", tuple(sample['image'].shape) == (2, 3, 224, 224))
     else:
         print("\n(skipping SONICOM dataset check -- pass --sonicom_dir to enable)")
 
