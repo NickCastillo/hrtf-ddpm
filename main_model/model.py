@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import math
+import torchvision
 
 
 class DiffusionModel:
@@ -79,25 +80,50 @@ class SelfAttention1d(nn.Module):
 
 class ImageEncoder(nn.Module):
     """
-    Encodes a subject's stacked L/R ear-crop images (6 channels: 3 per ear)
-    into one compact feature vector, computed ONCE per sample -- not once
-    per block. That vector is then fed into every block exactly like the
-    ear-measurement vector (see Block.image_fc). AdaptiveAvgPool2d makes
-    this indifferent to whatever crop resolution dataset.py hands it.
+    Encodes a subject's L/R ear-crop images into one compact feature vector,
+    computed ONCE per sample -- not once per block -- then fed into every
+    block exactly like the ear-measurement vector (see Block.image_fc).
+
+    Uses a frozen, ImageNet-pretrained MobileNetV2 as a feature extractor
+    rather than a CNN trained from scratch.
+
+    L and R images go through the SAME shared backbone separately (it
+    expects standard 3-channel input, matching its pretrained weights --
+    stacking L+R into 6 channels the way the from-scratch version did
+    would destroy the meaning of the pretrained first-layer weights) and
+    their pooled features are concatenated before the projection head.
+    Expects images as (B, 2, 3, H, W): dim 1 is [L, R].
     """
-    def __init__(self, out_dim, in_channels=6):
+    def __init__(self, out_dim):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 16, 3, stride=2, padding=1), nn.ReLU(),
-            nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=2, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
+        backbone = torchvision.models.mobilenet_v2(
+            weights=torchvision.models.MobileNet_V2_Weights.IMAGENET1K_V1
         )
-        self.fc = nn.Linear(64, out_dim)
+        self.features = backbone.features   # conv stack only, no classifier head
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        feat_dim = backbone.last_channel    # 1280 for mobilenet_v2
+
+        for p in self.features.parameters():
+            p.requires_grad = False
+        self.features.eval()
+
+        self.fc = nn.Linear(feat_dim * 2, out_dim)   # *2: L and R concatenated
+
+    def train(self, mode=True):
+        # Keep the frozen backbone's BatchNorm layers in eval mode (fixed
+        # running stats) even when the surrounding UNet is set to .train() --
+        # otherwise those stats would drift to this tiny, ear-photo-only
+        # dataset instead of staying at their ImageNet-trained values.
+        super().train(mode)
+        self.features.eval()
+        return self
 
     def forward(self, images):
-        return self.fc(self.conv(images).flatten(1))
+        left, right = images[:, 0], images[:, 1]
+        with torch.no_grad():   # frozen -- no need to build a backward graph
+            feat_l = self.pool(self.features(left)).flatten(1)
+            feat_r = self.pool(self.features(right)).flatten(1)
+        return self.fc(torch.cat([feat_l, feat_r], dim=1))
 
 
 class Block(nn.Module):

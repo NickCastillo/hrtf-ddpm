@@ -10,7 +10,9 @@ from PIL import Image
 import torchvision.transforms.functional as tvf
 
 
-IMAGE_SIZE = 128   # ear crops are resized to this (square) before the CNN image encoder
+IMAGE_SIZE = 224   # matches the resolution ImageEncoder's pretrained MobileNetV2 was trained at
+IMAGENET_MEAN = [0.485, 0.456, 0.406]   # required by any ImageNet-pretrained backbone
+IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 
 class HRTFDataset(Dataset):
@@ -48,13 +50,20 @@ class HRTFDataset(Dataset):
 
     # ── Ear-image loading (SONICOM only, conditions C/D) ─────────────────────
     def _load_ear_image(self, subject_id):
-        """Load+resize the L/R ear crops for one subject, stacked as a (6, H, W) tensor."""
+        """
+        Load+resize the L/R ear crops for one subject, kept as two separate
+        3-channel images (not stacked into 6 channels) and ImageNet-normalized,
+        since ImageEncoder runs each through a shared pretrained backbone that
+        expects standard 3-channel input on that exact normalization scale.
+        """
         sides = []
         for side in ('L', 'R'):
             path = os.path.join(self.image_dir, f'P{subject_id:04d}_{side}.jpg')
             img = Image.open(path).convert('RGB').resize((IMAGE_SIZE, IMAGE_SIZE))
-            sides.append(tvf.to_tensor(img))   # (3, H, W) in [0,1]
-        return torch.cat(sides, dim=0)   # (6, H, W)
+            tensor = tvf.to_tensor(img)   # (3, H, W) in [0,1]
+            tensor = tvf.normalize(tensor, mean=IMAGENET_MEAN, std=IMAGENET_STD)
+            sides.append(tensor)
+        return torch.stack(sides, dim=0)   # (2, 3, H, W) -- dim 0 is [L, R]
 
     def load_data(self):
         # ── Discover subjects from HRIR files present in hrtf_directory ─────────
@@ -70,6 +79,13 @@ class HRTFDataset(Dataset):
         # so head/torso columns (present in HUTUBS, absent in SONICOM) never
         # need to be counted or sliced around -- this is what lets the same
         # loading code work for both CSVs.
+        # Both encoding and delimiter are auto-detected rather than assumed:
+        # a CSV re-saved by Excel/Numbers (e.g. just to look at it) can come
+        # back as Windows-1252/Latin-1 instead of UTF-8, and/or ';'-delimited
+        # instead of ','-delimited depending on the app's regional settings --
+        # `sep=None, engine='python'` sniffs the real delimiter instead of
+        # hardcoding one, and Latin-1 never raises (every byte maps to some
+        # character), so this is robust to whichever tool last touched the file.
         try:
             af_csv = pd.read_csv(self.anthro_csv_path, header=0, sep=None, engine='python', encoding='utf-8')
         except UnicodeDecodeError:
@@ -112,6 +128,13 @@ class HRTFDataset(Dataset):
         # ── Measurement grid: read point count from the data itself ────────────
         self.measurement_points = sofa_files[0][1].getDataIR().shape[0]
 
+        # ── Ear images, decoded once per subject (not once per measurement point) ─
+        # A subject has hundreds of HRIR points but only one L/R image pair --
+        # decoding it fresh in every __getitem__ call means re-reading and
+        # re-resizing the same two JPEGs up to measurement_points times per
+        # subject, per epoch. Caching all subjects' images here instead costs
+        # ~90 subjects x 6x128x128 floats (~35MB total) and removes disk I/O
+        # + decode entirely from the training hot path.
         self.image_by_id = {}
         if self.image_dir is not None:
             self.image_by_id = {sid: self._load_ear_image(sid) for sid in self.valid_subject_indices}
