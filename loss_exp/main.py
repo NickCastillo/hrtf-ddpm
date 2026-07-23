@@ -1,6 +1,8 @@
 """
-Loss-function ablation driver (L1 vs L2 vs combined loss).
+Loss-function ablation driver (L1 vs L2 vs the production combined loss).
 
+Lives in loss_exp/, a sibling of main_model/ (which holds dataset.py,
+model.py, utils.py, main.py -- none of them are modified by this script).
 This file is a restructured copy of main_model/main.py: same dataset
 loading, same UNet, same training/inference loops, same metrics. The two
 things that differ:
@@ -152,14 +154,19 @@ parser.add_argument('--model_name', type=str, default=None,
                          'clobber each other. Defaults to '
                          '"<DATASET>_lossexp_<condition>".')
 parser.add_argument('--checkpoint_dir', type=str, default=None,
-                    help='Only honoured when --loss_type is a single value (not '
-                         '"all") — with multiple loss types this would make them '
-                         'overwrite each other, so it is ignored and the auto '
-                         'per-loss-type path is used instead.')
+                    help='Base directory for checkpoints (e.g. a Drive path so they '
+                         'survive a Colab runtime recycle). Defaults to "./checkpoints" '
+                         '(relative to wherever the script is launched — NOT persistent '
+                         'on Colab). Every run is namespaced under "<this>/<model_name>_'
+                         '<loss_type>" regardless of --loss_type, so passing your own '
+                         'path here still keeps l1/l2/combined (and different folds, '
+                         'conditions, datasets) from overwriting each other.')
 parser.add_argument('--results_dir', type=str, default=None,
-                    help='Same caveat as --checkpoint_dir.')
+                    help='Same as --checkpoint_dir, but for .mat/plots/xlsx output. '
+                         'Defaults to "./results".')
 parser.add_argument('--runs_dir', type=str, default=None,
-                    help='Same caveat as --checkpoint_dir.')
+                    help='Same as --checkpoint_dir, but for TensorBoard event files. '
+                         'Defaults to "./runs".')
 parser.add_argument('--k_folds', type=int, default=5)
 parser.add_argument('--hrtf_directory', type=str, default=None,
                     help='Defaults to ./HUTUBS/HRIRs or ./SONICOM/HRIRs depending on --dataset.')
@@ -190,11 +197,16 @@ for key, default in DATASET_DEFAULTS[args.dataset].items():
 BASE_MODEL_NAME = args.model_name or f'{args.dataset.upper()}_lossexp_{args.condition}'
 
 loss_types_to_run = list(LOSS_TYPES) if args.loss_type == 'all' else [args.loss_type]
-if args.loss_type == 'all' and (args.checkpoint_dir or args.results_dir or args.runs_dir):
-    print("Note: --checkpoint_dir/--results_dir/--runs_dir are ignored when "
-          "--loss_type all runs multiple losses in one invocation (each loss "
-          "type gets its own auto-namespaced dir instead, so they don't "
-          "overwrite each other).")
+
+# Base dirs: your own path if given (e.g. Drive), else the ./checkpoints etc.
+# default. NOTE this default is relative to the current working directory --
+# on Colab that's wherever the notebook cell runs from, which lives on the
+# ephemeral local disk and is wiped on runtime recycle. Always pass explicit
+# --checkpoint_dir/--results_dir/--runs_dir pointing at Drive if you want
+# results to survive a disconnect.
+CKPT_BASE = args.checkpoint_dir or './checkpoints'
+RES_BASE  = args.results_dir    or './results'
+RUNS_BASE = args.runs_dir       or './runs'
 
 print(f"Base model name: {BASE_MODEL_NAME}  |  dataset={args.dataset}  |  "
       f"condition={args.condition}  |  loss_type(s)={loss_types_to_run}  |  "
@@ -785,10 +797,15 @@ comparison = {}   # loss_type -> summary dict, used for the final comparison tab
 for CURRENT_LOSS_TYPE in loss_types_to_run:
     MODEL_NAME = f'{BASE_MODEL_NAME}_{CURRENT_LOSS_TYPE}'
 
-    single_loss_run = (args.loss_type != 'all')
-    CKPT_DIR  = args.checkpoint_dir if (single_loss_run and args.checkpoint_dir) else os.path.join('./checkpoints', MODEL_NAME)
-    RES_DIR   = args.results_dir    if (single_loss_run and args.results_dir)    else os.path.join('./results',     MODEL_NAME)
-    RUNS_DIR  = args.runs_dir       if (single_loss_run and args.runs_dir)       else os.path.join('./runs',        MODEL_NAME)
+    # Always nested under the base dir by MODEL_NAME (base name + loss type),
+    # whether that base is the ./checkpoints|results|runs default or an
+    # explicit path you passed in (e.g. Drive) -- see CKPT_BASE/RES_BASE/
+    # RUNS_BASE above. This is what keeps l1/l2/combined (and different
+    # folds, conditions, datasets sharing the same base dir) from ever
+    # overwriting each other, without silently discarding a path you gave.
+    CKPT_DIR  = os.path.join(CKPT_BASE, MODEL_NAME)
+    RES_DIR   = os.path.join(RES_BASE,  MODEL_NAME)
+    RUNS_DIR  = os.path.join(RUNS_BASE, MODEL_NAME)
     MAT_DIR   = os.path.join(RES_DIR, 'mat')
     PLOTS_DIR = os.path.join(RES_DIR, 'plots')
 
