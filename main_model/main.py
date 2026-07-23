@@ -605,9 +605,9 @@ def infer_fold(fold_idx, split, subj_point_index):
     unet = build_unet()
     ckpt = torch.load(model_path, map_location=device, weights_only=False)
     if args.use_ema and 'ema_state_dict' in ckpt:
-        # ema_state_dict only ever contains *trainable* parameters. ImageEncoder's pretrained MobileNetV2
+        # ema_state_dict only ever contains *trainable* parameters, ImageEncoder's pretrained MobileNetV2
         # backbone (condition C/D), and any BatchNorm running-stat buffers
-        # inside it, are deliberately never tracked,
+        # inside it, are deliberately never tracked
         full_state = unet.state_dict()
         n_ema = len(ckpt['ema_state_dict'])
         full_state.update(ckpt['ema_state_dict'])
@@ -717,7 +717,8 @@ def infer_fold(fold_idx, split, subj_point_index):
             x            = torch.randn(b, 2, 256, device=device)
             labels_batch = torch.tensor(pts, device=device)
             ears_batch   = ears_1.unsqueeze(0).expand(b, -1)
-            images_batch = images_1.unsqueeze(0).expand(b, -1, -1, -1) if images_1 is not None else None
+
+            images_batch = images_1.unsqueeze(0).expand(b, -1, -1, -1, -1) if images_1 is not None else None
  
             with torch.no_grad():
                 for i in reversed(range(diffusion_model.timesteps)):
