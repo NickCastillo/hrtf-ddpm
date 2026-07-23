@@ -11,11 +11,11 @@ import os
 import json
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
-
+ 
 from dataset import HUTUBSDataset, SONICOMDataset, collate_fn
 from model import DiffusionModel, UNet
 from utils import plot_noise_distribution, nmse, lsd, itd_error, pbc, combined_loss, EMA, load_matching_state_dict
-
+ 
 # Conditioning per SONICOM ablation condition (ear_dim, use_image). head_dim
 # stays 0 everywhere -- neither dataset has head/torso measurements.
 # IMAGE_FEAT_DIM is the width of the vector ImageEncoder produces (see
@@ -27,14 +27,14 @@ CONDITIONS = {
     'C': dict(ear_dim=0,  use_image=True),    # image-only
     'D': dict(ear_dim=24, use_image=True),    # anthro + image
 }
-
+ 
 # ── Device ────────────────────────────────────────────────────────────────────
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
-
+ 
 # TF32 on Ampere GPUs — free ~5-10% speedup, no effect on model behaviour
 torch.set_float32_matmul_precision('high')
-
+ 
 def str2bool(v):
     """Allow --flag true/false, yes/no, 1/0, t/f on the command line."""
     if isinstance(v, bool):
@@ -44,8 +44,8 @@ def str2bool(v):
     elif v.lower() in ('no', 'false', 'f', 'n', '0'):
         return False
     raise argparse.ArgumentTypeError(f"Boolean value expected, got '{v}'.")
-
-
+ 
+ 
 # ── Arguments ─────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description='HRTF DDPM — per-fold training & inference')
 parser.add_argument('--mode', type=str, choices=['train', 'infer'], required=True,
@@ -156,13 +156,13 @@ parser.add_argument('--image_dir', type=str, default=None,
                          'Defaults to ./SONICOM/cropped.')
 parser.add_argument('--verbose', action='store_true')
 args = parser.parse_args()
-
+ 
 # HUTUBS never has images, so it only ever runs condition B (ear-only) --
 # the same conditioning the original HUTUBS_model baseline always used.
 if args.dataset == 'hutubs' and args.condition != 'B':
     print(f"Note: --dataset hutubs only supports condition B — overriding --condition {args.condition} -> B")
     args.condition = 'B'
-
+ 
 # Fill in dataset-specific defaults for whichever path args weren't given explicitly.
 DATASET_DEFAULTS = {
     'hutubs':  dict(hrtf_directory='./HUTUBS/HRIRs',
@@ -174,14 +174,14 @@ DATASET_DEFAULTS = {
 for key, default in DATASET_DEFAULTS[args.dataset].items():
     if getattr(args, key) is None:
         setattr(args, key, default)
-
+ 
 if args.model_name is None:
     args.model_name = 'HUTUBS_model' if args.dataset == 'hutubs' else f'SONICOM_{args.condition}'
-
+ 
 # MODEL_NAME tags every exported output (see --model_name help above).
 # Kept as a module-level alias for readability at call sites below.
 MODEL_NAME = args.model_name
-
+ 
 # Namespace default output dirs under model_name unless explicitly overridden,
 # so e.g. `--model_name HUTUBS_model_full_attn` automatically writes to
 # ./checkpoints/HUTUBS_model_full_attn, ./results/HUTUBS_model_full_attn, etc.
@@ -192,10 +192,10 @@ if args.results_dir is None:
     args.results_dir = os.path.join('./results', args.model_name)
 if args.runs_dir is None:
     args.runs_dir = os.path.join('./runs', args.model_name)
-
+ 
 print(f"Model name: {MODEL_NAME}  |  dataset={args.dataset}  |  condition={args.condition}  |  "
       f"full_attention={args.full_attention}")
-
+ 
 # ── Directory layout ──────────────────────────────────────────────────────────
 #
 #   checkpoint_dir/          ← splits.json + unet_fold1.pt ...
@@ -210,17 +210,17 @@ RES_DIR   = args.results_dir
 RUNS_DIR  = args.runs_dir
 MAT_DIR   = os.path.join(RES_DIR, 'mat')
 PLOTS_DIR = os.path.join(RES_DIR, 'plots')
-
+ 
 for d in [RUNS_DIR, CKPT_DIR, RES_DIR, MAT_DIR, PLOTS_DIR]:
     os.makedirs(d, exist_ok=True)
-
+ 
 # Pre-create per-fold run dirs so TensorBoard sees them immediately
 for fi in range(5):   # max k_folds; harmless extras are ignored
     os.makedirs(os.path.join(RUNS_DIR, f'fold_{fi + 1}'), exist_ok=True)
-
+ 
 # splits.json lives in checkpoints/ so it travels with the model weights
 SPLITS_PATH = os.path.join(CKPT_DIR, 'splits.json')
-
+ 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 print("Loading dataset...")
 condition = CONDITIONS[args.condition]
@@ -238,13 +238,13 @@ else:
         image_dir=args.image_dir if condition['use_image'] else None,
     )
 print(f"Dataset size: {len(dataset)} samples  |  measurement points: {dataset.measurement_points}")
-
+ 
 # splits_meta.json travels alongside splits.json and records the k_folds
 # setting used to build the cached splits, so a cache built with a
 # different fold count is regenerated rather than reused verbatim.
 SPLITS_META_PATH = os.path.join(CKPT_DIR, 'splits_meta.json')
-
-
+ 
+ 
 def _splits_need_regen():
     if not os.path.exists(SPLITS_PATH):
         return True
@@ -254,8 +254,8 @@ def _splits_need_regen():
     with open(SPLITS_META_PATH) as f:
         meta = json.load(f)
     return meta.get('k_folds') != args.k_folds
-
-
+ 
+ 
 if _splits_need_regen():
     splits = dataset.get_kfold_splits(k=args.k_folds)
     splits_serialisable = [
@@ -271,7 +271,7 @@ else:
     with open(SPLITS_PATH) as f:
         splits = json.load(f)
     print(f"Loaded existing splits from {SPLITS_PATH}")
-
+ 
 # Resolve folds to run
 if args.fold is not None:
     for f in args.fold:
@@ -280,12 +280,12 @@ if args.fold is not None:
     fold_indices = [f - 1 for f in args.fold]
 else:
     fold_indices = list(range(len(splits)))
-
+ 
 # ── Diffusion model ───────────────────────────────────────────────────────────
 diffusion_model = DiffusionModel()   # 600 timesteps
 NUM_CLASSES = dataset.measurement_points   # 440 for HUTUBS, 793 for SONICOM
-
-
+ 
+ 
 # ── Precision selection ───────────────────────────────────────────────────────
 # base_channels=16 → (64,128,256,512,1024): large model prone to FP16 overflow.
 # All other base_channels use FP16 autocast for speed.
@@ -293,8 +293,8 @@ BASE_CHANNELS = 8
 USE_FP16 = (BASE_CHANNELS != 16)
 PRECISION_DTYPE = torch.float16 if USE_FP16 else torch.float32
 print(f"Precision: {'FP16 (autocast)' if USE_FP16 else 'FP32 (large model — NaN-safe)'}")
-
-
+ 
+ 
 def build_unet():
     """
     Paper architecture: channel mults (4,8,16,32,64) x BASE_CHANNELS, 4 encoder blocks
@@ -318,19 +318,19 @@ def build_unet():
     if hasattr(torch, 'compile'):
         unet = torch.compile(unet)
     return unet
-
-
+ 
+ 
 def ckpt_path(fold_idx):
     return os.path.join(CKPT_DIR, f'unet_fold{fold_idx + 1}.pt')
-
-
+ 
+ 
 def build_subject_point_index(dataset):
     idx_map = {}
     for i, item in enumerate(dataset.normalized_dataset):
         idx_map[(item['subject_id'], item['measurement_point'])] = i
     return idx_map
-
-
+ 
+ 
 # ═════════════════════════════════════════════════════════════════════════════
 # TRAINING
 # ═════════════════════════════════════════════════════════════════════════════
@@ -340,10 +340,10 @@ def train_fold(fold_idx, split):
     print(f"  TRAINING  FOLD {fold_idx + 1}/{args.k_folds}  |  "
           f"test subjects: {split['test_subjects']}")
     print(f"{'='*60}")
-
+ 
     # ── TensorBoard writer for this fold ─────────────────────────────────────
     writer = SummaryWriter(log_dir=os.path.join(RUNS_DIR, fold_tag))
-
+ 
     # Log hyperparameters once per fold so they appear in the HParams tab
     writer.add_hparams(
         hparam_dict={
@@ -362,7 +362,7 @@ def train_fold(fold_idx, split):
         },
         metric_dict={'best_val_loss': float('inf')},   # updated at end
     )
-
+ 
     train_loader = DataLoader(
         Subset(dataset, split['train']),
         batch_size=args.BATCH_SIZE, shuffle=True,
@@ -375,7 +375,7 @@ def train_fold(fold_idx, split):
         num_workers=4, drop_last=False, collate_fn=collate_fn,
         pin_memory=True, persistent_workers=True, prefetch_factor=4,
     )
-
+ 
     unet = build_unet()
     if args.pretrained_checkpoint:
         # Partially init from the matching HUTUBS fold -- see
@@ -396,7 +396,7 @@ def train_fold(fold_idx, split):
         )
     optimizer = torch.optim.Adam(unet.parameters(), lr=args.lr)
     ema = EMA(unet, decay=args.ema_decay)
-
+ 
     # Warmup and plateau scheduling are applied manually (not via SequentialLR)
     # because ReduceLROnPlateau requires a metric at step() time and isn't a
     # standard chainable _LRScheduler. During the first lr_warmup_epochs we
@@ -412,18 +412,18 @@ def train_fold(fold_idx, split):
         patience=args.lr_plateau_patience,
         min_lr=args.lr_min,
     )
-
+ 
     # GradScaler: disabled for FP32 (large model), conservative for FP16
     scaler = torch.cuda.amp.GradScaler(init_scale=1024, enabled=(device.type == 'cuda' and USE_FP16))
-
+ 
     best_val_loss    = float('inf')
     early_stop_count = 0
     model_path       = ckpt_path(fold_idx)
     plots_fold_dir   = os.path.join(PLOTS_DIR, fold_tag)
     os.makedirs(plots_fold_dir, exist_ok=True)
-
+ 
     for epoch in tqdm.tqdm(range(args.epochs), desc=fold_tag, unit='epoch'):
-
+ 
         # ── Train ─────────────────────────────────────────────────────────────
         unet.train()
         train_losses = []
@@ -437,11 +437,11 @@ def train_fold(fold_idx, split):
             # (SONICOM conditions C/D) -- harmless to pass as None otherwise,
             # UNet only reads it when its own image_dim > 0.
             images = data['image'].to(device, non_blocking=True) if 'image' in data else None
-
+ 
             t = torch.randint(0, diffusion_model.timesteps,
                               (batch.shape[0],), device=device).long()
             batch_noisy, noise = diffusion_model.forward(batch, t, device)
-
+ 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=PRECISION_DTYPE, enabled=USE_FP16):
                 predicted_noise = unet(
@@ -467,7 +467,7 @@ def train_fold(fold_idx, split):
                 train_losses.append(loss.item())
                 train_l1_time.append(l1_time_c.item())
                 train_l1_freq.append(l1_freq_c.item())
-
+ 
         # ── Validate (using EMA weights — swapped in for the duration) ──────────
         ema.apply_shadow(unet)
         unet.eval()
@@ -479,7 +479,7 @@ def train_fold(fold_idx, split):
                 label = data['measurement_point'].to(device, non_blocking=True)
                 ears  = data['ear_measurements'].to(device, non_blocking=True)
                 images = data['image'].to(device, non_blocking=True) if 'image' in data else None
-
+ 
                 t = torch.randint(0, diffusion_model.timesteps,
                                   (batch.shape[0],), device=device).long()
                 batch_noisy, noise = diffusion_model.forward(batch, t, device)
@@ -493,10 +493,10 @@ def train_fold(fold_idx, split):
                 )
                 last_noise, last_pred = noise, pred   # keep last batch for plots
         ema.restore(unet)
-
+ 
         mean_train = np.mean(train_losses)
         mean_val   = np.mean(val_losses)
-
+ 
         # Warmup for the first lr_warmup_epochs, then hand off to the
         # validation-driven plateau scheduler.
         if epoch < args.lr_warmup_epochs:
@@ -504,7 +504,7 @@ def train_fold(fold_idx, split):
         else:
             plateau_scheduler.step(mean_val)
         current_lr = optimizer.param_groups[0]['lr']
-
+ 
         # ── TensorBoard scalars ───────────────────────────────────────────────
         writer.add_scalar('Loss/train',      mean_train, epoch)
         writer.add_scalar('Loss/val',        mean_val,   epoch)
@@ -512,14 +512,14 @@ def train_fold(fold_idx, split):
         writer.add_scalar('Loss/train_l1_freq', np.mean(train_l1_freq), epoch)
         writer.add_scalar('LR/learning_rate', current_lr, epoch)
         writer.add_scalar('EarlyStopping/patience_counter', early_stop_count, epoch)
-
+ 
         # Gradient norm (useful for diagnosing training stability)
         total_grad_norm = sum(
             p.grad.data.norm(2).item() ** 2
             for p in unet.parameters() if p.grad is not None
         ) ** 0.5
         writer.add_scalar('Gradients/total_norm', total_grad_norm, epoch)
-
+ 
         # ── Noise-distribution plot → TensorBoard + disk (every 50 epochs) ───
         if epoch % 50 == 0 and last_noise is not None:
             # Guard against NaN predictions crashing the histogram
@@ -532,11 +532,11 @@ def train_fold(fold_idx, split):
             img = Image.open(plot_path)
             img_tensor = tvf.to_tensor(img)          # (C, H, W) in [0,1]
             writer.add_image(f'NoiseDist/epoch_{epoch:04d}', img_tensor, epoch)
-
+ 
         if args.verbose or epoch % 50 == 0:
             print(f"  Epoch {epoch:4d} | Train {mean_train:.4f} | Val {mean_val:.4f} | "
                   f"LR {current_lr:.2e} | Patience {early_stop_count}/{args.early_stop_patience}")
-
+ 
         # ── Checkpoint ────────────────────────────────────────────────────────
         if mean_val < best_val_loss:
             best_val_loss = mean_val
@@ -555,13 +555,13 @@ def train_fold(fold_idx, split):
                 print(f"  ✓ Checkpoint saved — val {best_val_loss:.4f}")
         elif epoch >= args.early_stop_min_epoch:
             early_stop_count += 1
-
+ 
         writer.flush()
-
+ 
         if early_stop_count > args.early_stop_patience:
             print(f"  Early stopping at epoch {epoch}")
             break
-
+ 
     # Update hparams with final metric so the HParams tab shows real values
     writer.add_hparams(
         hparam_dict={
@@ -582,8 +582,8 @@ def train_fold(fold_idx, split):
     writer.close()
     print(f"  Fold {fold_idx + 1} done — best val loss: {best_val_loss:.4f}")
     return best_val_loss
-
-
+ 
+ 
 # ═════════════════════════════════════════════════════════════════════════════
 # INFERENCE
 # ═════════════════════════════════════════════════════════════════════════════
@@ -592,21 +592,31 @@ def infer_fold(fold_idx, split, subj_point_index):
     if not os.path.exists(model_path):
         print(f"No checkpoint at {model_path} — skipping fold {fold_idx + 1}")
         return [], [], [], [], [], [], [], []
-
+ 
     fold_tag = f'fold_{fold_idx + 1}'
     print(f"\n{'='*60}")
     print(f"  INFERENCE  FOLD {fold_idx + 1}/{args.k_folds}  |  "
           f"test subjects: {split['test_subjects']}")
     print(f"{'='*60}")
-
+ 
     # ── TensorBoard writer for inference metrics ──────────────────────────────
     writer = SummaryWriter(log_dir=os.path.join(RUNS_DIR, fold_tag))
-
+ 
     unet = build_unet()
     ckpt = torch.load(model_path, map_location=device, weights_only=False)
     if args.use_ema and 'ema_state_dict' in ckpt:
-        unet.load_state_dict(ckpt['ema_state_dict'])
-        print(f"  Loaded EMA weights from {model_path}")
+        # ema_state_dict only ever contains *trainable* parameters. ImageEncoder's pretrained MobileNetV2
+        # backbone (condition C/D), and any BatchNorm running-stat buffers
+        # inside it, are deliberately never tracked,
+        full_state = unet.state_dict()
+        n_ema = len(ckpt['ema_state_dict'])
+        full_state.update(ckpt['ema_state_dict'])
+        unet.load_state_dict(full_state)
+        print(f"  Loaded EMA weights from {model_path} "
+              f"({n_ema}/{len(full_state)} tensors were EMA-tracked; the remaining "
+              f"{len(full_state) - n_ema} are frozen/non-trainable — e.g. the "
+              f"pretrained image encoder backbone — and kept their freshly "
+              f"constructed values)")
     else:
         if args.use_ema:
             print(f"  Warning: --use_ema=True but checkpoint has no 'ema_state_dict' "
@@ -615,20 +625,20 @@ def infer_fold(fold_idx, split, subj_point_index):
     unet.eval()
     if hasattr(torch, 'compile'):
         unet = torch.compile(unet)
-
+ 
     # Pre-compute schedule tensors on GPU once
     betas_gpu              = diffusion_model.betas.to(device)
     alphas_gpu             = diffusion_model.alphas.to(device)
     sqrt_recip_alphas_gpu  = torch.sqrt(1.0 / alphas_gpu)
     sqrt_one_minus_acp_gpu = torch.sqrt(1.0 - diffusion_model.alphas_cumprod.to(device))
-
+ 
     # Output dirs
     wav_dir   = os.path.join(RES_DIR, fold_tag)
     mat_fold  = os.path.join(MAT_DIR,  fold_tag)
     plot_fold = os.path.join(PLOTS_DIR, fold_tag)
     for d in [wav_dir, mat_fold, plot_fold]:
         os.makedirs(d, exist_ok=True)
-
+ 
     # Resume support
     #
     # 'subject_ids' and 'nmse_subj' are tracked explicitly (rather than
@@ -656,7 +666,7 @@ def infer_fold(fold_idx, split, subj_point_index):
             progress = dict(_empty_progress)
     else:
         progress = dict(_empty_progress)
-
+ 
     done_set     = set(progress['done_subjects'])
     fold_subject_ids = progress['subject_ids']
     fold_lsd_L   = progress['lsd_L']
@@ -667,21 +677,21 @@ def infer_fold(fold_idx, split, subj_point_index):
     fold_nmse    = progress['nmse']
     fold_nmse_subj = progress['nmse_subj']
     INFER_BATCH = 64
-
+ 
     for subject_id in tqdm.tqdm(split['test_subjects'], desc=f'{fold_tag} infer'):
         if subject_id in done_set:
             continue
-
+ 
         hrir_sub  = []
         hrir_tsub = []
         nmse_sub  = []
-
+ 
         data_ref = dataset[subj_point_index[(subject_id, 0)]]
         ears_1  = data_ref['ear_measurements'].to(device).float()
         images_1 = data_ref['image'].to(device).float() if 'image' in data_ref else None
         g_std  = data_ref['global_std']
         g_mean = data_ref['global_mean']
-
+ 
         gt_hrirs     = []
         valid_points = []
         for c in range(dataset.measurement_points):
@@ -690,32 +700,32 @@ def infer_fold(fold_idx, split, subj_point_index):
                 continue
             gt_hrirs.append(dataset[subj_point_index[key]]['hrtf'])
             valid_points.append(c)
-
+ 
         n_points = len(valid_points)
         if n_points == 0:
             continue
-
+ 
         # ── Batched denoising (all positions in parallel) ─────────────────────
         all_results = []
         torch.manual_seed(42)
-
+ 
         for start in range(0, n_points, INFER_BATCH):
             end = min(start + INFER_BATCH, n_points)
             b   = end - start
             pts = valid_points[start:end]
-
+ 
             x            = torch.randn(b, 2, 256, device=device)
             labels_batch = torch.tensor(pts, device=device)
             ears_batch   = ears_1.unsqueeze(0).expand(b, -1)
             images_batch = images_1.unsqueeze(0).expand(b, -1, -1, -1) if images_1 is not None else None
-
+ 
             with torch.no_grad():
                 for i in reversed(range(diffusion_model.timesteps)):
                     t_batch      = torch.full((b,), i, dtype=torch.long, device=device)
                     betas_t      = betas_gpu[i].view(1, 1, 1)
                     sqrt_recip_t = sqrt_recip_alphas_gpu[i].view(1, 1, 1)
                     sqrt_omacp_t = sqrt_one_minus_acp_gpu[i].view(1, 1, 1)
-
+ 
                     predicted_noise = unet(
                         x, t_batch,
                         labels=labels_batch,
@@ -724,31 +734,31 @@ def infer_fold(fold_idx, split, subj_point_index):
                     )
                     mean = sqrt_recip_t * (x - betas_t * predicted_noise / sqrt_omacp_t)
                     x = mean + (torch.sqrt(betas_t) * torch.randn_like(x) if i > 0 else 0)
-
+ 
             all_results.append(x.cpu())
-
+ 
         results_tensor = torch.cat(all_results, dim=0)   # (n_points, 2, 256)
-
+ 
         # ── Metrics, plots, saving ────────────────────────────────────────────
         gen_hrirs_mat  = []
         gt_hrirs_mat   = []
-
+ 
         for j, c in enumerate(valid_points):
             audio_result = results_tensor[j]
             hrir_test    = gt_hrirs[j]
-
+ 
             if torch.isnan(audio_result).any():
                 print(f"  NaN: subject {subject_id}, point {c} — skipping")
                 continue
-
+ 
             err = nmse(hrir_test=hrir_test, hrir_gen=audio_result)
             nmse_sub.append(err.item())
-
+ 
             hrir_sub.append(audio_result)
             hrir_tsub.append(hrir_test)
             gen_hrirs_mat.append(audio_result.float().numpy())
             gt_hrirs_mat.append(hrir_test.float().numpy())
-
+ 
         # ── Per-subject metrics + .mat ───────────────────────────────────────
         if gen_hrirs_mat:
             n_valid      = len(hrir_sub)
@@ -773,7 +783,7 @@ def infer_fold(fold_idx, split, subj_point_index):
                     'positions':   np.array(valid_points,   dtype=np.int32),
                 }
             )
-
+ 
         # ── Aggregate + TensorBoard per subject ─────────────────────────────
         if hrir_sub:
             # subject_id is appended in lockstep with every subject-level
@@ -788,20 +798,20 @@ def infer_fold(fold_idx, split, subj_point_index):
             fold_pbc.append(pbc_val_sub)
             fold_nmse.extend(nmse_sub)
             fold_nmse_subj.append(float(np.mean(nmse_sub)))
-
+ 
             writer.add_scalar(f'Inference/LSD_L_sub_{subject_id}',  float(lsd_L_sub),         fold_idx + 1)
             writer.add_scalar(f'Inference/LSD_R_sub_{subject_id}',  float(lsd_R_sub),         fold_idx + 1)
             writer.add_scalar(f'Inference/LSD_avg_sub_{subject_id}',float(lsd_avg_sub),        fold_idx + 1)
             writer.add_scalar(f'Inference/ITD_sub_{subject_id}',    float(itd_val_sub),        fold_idx + 1)
             writer.add_scalar(f'Inference/PBC_sub_{subject_id}',    float(pbc_val_sub),        fold_idx + 1)
             writer.add_scalar(f'Inference/NMSE_sub_{subject_id}',   float(np.mean(nmse_sub)),  fold_idx + 1)
-
+ 
             print(f"  Subject {subject_id}: "
                   f"LSD_L={lsd_L_sub:.3f}  LSD_R={lsd_R_sub:.3f}  LSD_avg={lsd_avg_sub:.3f} dB  "
                   f"ITD={itd_val_sub:.2f} µs  "
                   f"PBC={pbc_val_sub:.3f} dB  "
                   f"NMSE={np.mean(nmse_sub):.4f}")
-
+ 
         # ── Persist progress (atomic write — crash-safe) ──────────────────────
         progress['done_subjects'].append(int(subject_id))
         progress['subject_ids'] = [int(v) for v in fold_subject_ids]
@@ -816,7 +826,7 @@ def infer_fold(fold_idx, split, subj_point_index):
         with open(tmp_path, 'w') as f:
             json.dump(progress, f)
         os.replace(tmp_path, progress_path)   # atomic on POSIX and Windows
-
+ 
     # ── Fold-level summary scalars ─────────────────────────────────────────────
     if fold_lsd_avg:
         writer.add_scalar('Inference/mean_LSD_L',   float(np.mean(fold_lsd_L)),   fold_idx + 1)
@@ -825,7 +835,7 @@ def infer_fold(fold_idx, split, subj_point_index):
         writer.add_scalar('Inference/mean_ITD',     float(np.mean(fold_itd)),     fold_idx + 1)
         writer.add_scalar('Inference/mean_PBC',     float(np.mean(fold_pbc)),     fold_idx + 1)
         writer.add_scalar('Inference/mean_NMSE',    float(np.mean(fold_nmse)),    fold_idx + 1)
-
+ 
         # Fold-level .mat
         # 'subject_id_per_subject' is saved in the same order as every
         # *_per_subject array above (built via the same per-subject loop,
@@ -855,7 +865,7 @@ def infer_fold(fold_idx, split, subj_point_index):
                 'mean_nmse':          float(np.mean(fold_nmse)),
             }
         )
-
+ 
     writer.flush()
     writer.close()
     print(f"  Fold {fold_idx + 1} — "
@@ -866,8 +876,8 @@ def infer_fold(fold_idx, split, subj_point_index):
           f"PBC={np.mean(fold_pbc):.3f} dB  "
           f"NMSE={np.mean(fold_nmse):.4f}")
     return fold_subject_ids, fold_lsd_L, fold_lsd_R, fold_lsd_avg, fold_itd, fold_pbc, fold_nmse, fold_nmse_subj
-
-
+ 
+ 
 # ═════════════════════════════════════════════════════════════════════════════
 # MAIN DISPATCH
 # ═════════════════════════════════════════════════════════════════════════════
@@ -875,19 +885,19 @@ if args.mode == 'train':
     all_val_losses = []
     for fi in fold_indices:
         all_val_losses.append(train_fold(fi, splits[fi]))
-
+ 
     if len(all_val_losses) > 1:
         print(f"\nCross-validation summary:")
         print(f"  Per-fold val losses : {[f'{v:.4f}' for v in all_val_losses]}")
         print(f"  Mean ± std          : "
               f"{np.mean(all_val_losses):.4f} ± {np.std(all_val_losses):.4f}")
-
+ 
 else:
     subj_point_index = build_subject_point_index(dataset)
-
+ 
     for fi in fold_indices:
         infer_fold(fi, splits[fi], subj_point_index)
-
+ 
     all_subject_ids, all_lsd_L, all_lsd_R, all_lsd_avg = [], [], [], []
     all_itd_vals, all_pbc_vals, all_nmse_vals, all_nmse_subj = [], [], [], []
     for fi in range(len(splits)):
@@ -903,7 +913,7 @@ else:
         all_pbc_vals.extend(m['pbc_per_subject'].ravel().tolist())
         all_nmse_subj.extend(m['nmse_per_subject'].ravel().tolist())
         all_nmse_vals.extend(m['nmse_per_position'].ravel().tolist())
-
+ 
     if all_lsd_avg:
         print(f"\nOverall LSD_L  : {np.mean(all_lsd_L):.3f} ± {np.std(all_lsd_L):.3f} dB")
         print(f"Overall LSD_R  : {np.mean(all_lsd_R):.3f} ± {np.std(all_lsd_R):.3f} dB")
@@ -911,7 +921,7 @@ else:
         print(f"Overall ITD    : {np.mean(all_itd_vals):.2f} ± {np.std(all_itd_vals):.2f} µs")
         print(f"Overall PBC    : {np.mean(all_pbc_vals):.3f} ± {np.std(all_pbc_vals):.3f} dB")
         print(f"Overall NMSE   : {np.mean(all_nmse_vals):.4f} ± {np.std(all_nmse_vals):.4f}")
-
+ 
         sio.savemat(
             os.path.join(MAT_DIR, 'all_folds_summary.mat'),
             {
@@ -948,7 +958,7 @@ else:
             'pbc':     all_pbc_vals,
             'nmse':    all_nmse_subj,
         }).to_excel(os.path.join(RES_DIR, 'metrics_per_subject.xlsx'), index=False)
-
+ 
         # Per-position NMSE (one row per position across all subjects).
         # Finer-grained than the subject-level metrics above; not intended
         # for the per-subject paired Wilcoxon test, but kept for
