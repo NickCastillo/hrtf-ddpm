@@ -250,22 +250,44 @@ def itd_error(hrir_test_list, hrir_gen_list, sr=SR):
 
 # ── PBC ───────────────────────────────────────────────────────────────────────
 
-def _erb_filters(sr=SR, n_filters=40, f_low=50.0):
+def _erb_filters(sr=SR, n_filters=40, f_low=50.0, f_high=None):
     """
     Generate centre frequencies for an ERB (Equivalent Rectangular Bandwidth)
-    auditory filterbank spanning f_low to sr/2.
+    auditory filterbank spanning f_low to f_high, evenly spaced on the
+    ERB-RATE ("Cams") scale so that filter density matches auditory
+    frequency resolution -- dense at low frequencies, sparse at high --
+    which is the entire point of an auditory filterbank.
 
-    ERB scale per Moore & Glasberg (1983):
-        ERB(f) = 24.7 * (4.37*f/1000 + 1)
+    ERB-rate scale per Glasberg & Moore (1990):
+        ERBrate(f) = 21.4 * log10(4.37*f/1000 + 1)      [Cams]
+
+    BUG FIX: the previous version of this function used the ERB
+    *bandwidth* formula (ERB(f) = 24.7*(4.37*f/1000 + 1) -- correct, and
+    still used as-is in _gammatone_response below, where bandwidth is
+    what's actually needed) in place of the ERB-*rate* formula above.
+    Because the bandwidth formula is linear in f, linspacing in that
+    space and inverting it produces centre frequencies uniformly spaced
+    in Hz -- i.e. NO auditory warping at all, contradicting both this
+    function's docstring and pbc()'s claim of "perceptually-weighted
+    frequency emphasis". Confirmed numerically: the old code produced a
+    constant ~564 Hz spacing end-to-end. The fix below uses the actual
+    (logarithmic) ERB-rate scale, which concentrates filters at low/mid
+    frequencies as intended (e.g. ~30 Hz spacing near 50 Hz vs. ~1.5 kHz
+    spacing near 15 kHz).
+
+    f_high defaults to sr/2 (Nyquist) if not given. Pass f_high=15000 to
+    match LSD's F_MAX / paper Eq. 9 band -- see pbc()'s f_max parameter,
+    which does exactly that by default now.
 
     Returns array of centre frequencies in Hz.
     """
-    f_high  = sr / 2.0
-    erb_low  = 24.7 * (4.37 * f_low  / 1000 + 1)
-    erb_high = 24.7 * (4.37 * f_high / 1000 + 1)
+    if f_high is None:
+        f_high = sr / 2.0
+    erb_low  = 21.4 * np.log10(4.37 * f_low  / 1000 + 1)
+    erb_high = 21.4 * np.log10(4.37 * f_high / 1000 + 1)
     erbs     = np.linspace(erb_low, erb_high, n_filters)
-    # Invert ERB → Hz
-    cfs = (erbs / 24.7 - 1) / 4.37 * 1000
+    # Invert ERB-rate → Hz
+    cfs = (10 ** (erbs / 21.4) - 1) / 4.37 * 1000
     return cfs
 
 
@@ -340,13 +362,15 @@ def load_matching_state_dict(model, checkpoint_path, use_ema=True, reset_cond_fu
     print(msg)
 
 
-def pbc(hrir_test_list, hrir_gen_list, sr=SR, n_filters=40):
+def pbc(hrir_test_list, hrir_gen_list, sr=SR, n_filters=40, f_max=F_MAX):
     """
     Perceptual Blur Criterion (PBC) — binaural auditory model metric.
 
     Computes the mean spectral distortion between GT and generated HRTFs
     weighted by an ERB gammatone filterbank, giving perceptually-weighted
-    frequency emphasis (more weight to speech-important mid frequencies).
+    frequency emphasis (more weight to low/mid frequencies, per the fixed
+    ERB-rate scale in _erb_filters -- see that function's docstring for
+    the bug this corrects).
 
     Formula per position p, channel c, filter k:
         D(p,c,k) = 20*log10( sum_f |H_gt(f)| * g_k(f) )
@@ -357,6 +381,15 @@ def pbc(hrir_test_list, hrir_gen_list, sr=SR, n_filters=40):
     literature (Enzner 2008, Grigoriev et al.). Lower = more perceptually
     similar. Paper reports PBC alongside LSD and ITD (Sec. IV-B).
 
+    f_max caps the ERB filterbank's highest centre frequency (default
+    F_MAX=15000 Hz, matching LSD's paper Eq. 9 band and combined_loss's
+    frequency term) instead of the previous hardcoded sr/2 (Nyquist,
+    22050 Hz) -- so PBC, LSD, and the combined loss's frequency term all
+    evaluate the same 0-15kHz range consistently. Pass f_max=sr/2 to
+    restore the old full-band behaviour if a full-Nyquist PBC number is
+    ever needed (e.g. to reproduce the reference paper's own PBC, if it
+    used a different range -- check paper Sec. IV-B before assuming).
+
     hrir_test_list / hrir_gen_list: lists of (2, L) tensors or arrays.
     Returns scalar float (dB).
     """
@@ -365,7 +398,7 @@ def pbc(hrir_test_list, hrir_gen_list, sr=SR, n_filters=40):
 
     N = gt.shape[0]
     freqs = np.fft.rfftfreq(HRIR_LEN, d=1.0 / sr)   # (129,)
-    cfs   = _erb_filters(sr=sr, n_filters=n_filters)  # (n_filters,)
+    cfs   = _erb_filters(sr=sr, n_filters=n_filters, f_high=f_max)  # (n_filters,)
 
     # Pre-compute filter responses: (n_filters, n_freqs)
     filters = np.stack([_gammatone_response(freqs, cf) for cf in cfs], axis=0)
